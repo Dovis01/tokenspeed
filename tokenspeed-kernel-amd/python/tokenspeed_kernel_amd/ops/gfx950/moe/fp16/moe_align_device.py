@@ -28,8 +28,11 @@ the prefill path (large M), where the fused single-CTA align does not scale
 Gluon backend.
 
 Kernels:
-  1. ``_init_kernel``   -- parallel fill of the padding sentinel / zero weights
-                           and zero of the per-expert count buffer.
+  1. ``_init_kernel``   -- parallel fill of the padding sentinel / zero
+                           weights. The per-expert count buffer is zeroed by a
+                           separate ``torch.zeros``, or folded into this launch
+                           by ``_init_zero_counts_kernel`` when
+                           TSK_K3_MOE_ALIGN_FUSED_INIT=1.
   2. ``_count_kernel``  -- **parallel** per-CTA ``gl.histogram`` of an N-chunk,
                            atomic-added into a global ``counts`` buffer. This
                            replaces the old single-CTA histogram-over-N, which
@@ -51,8 +54,27 @@ are small ints, exact in fp32).
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+
+# --- TSK_K3_MOE_ALIGN_FUSED_INIT (default OFF) ------------------------
+# The align preamble issues five device launches per MoE layer per step: a
+# ``torch.zeros`` memset for ``counts``, then _init / _count / _offsets /
+# _scatter.  At decode shapes each of those kernels does almost no work and
+# sits at a ~4.3 us dispatch floor (measured, torch.profiler, gfx950, M=32:
+# zeros 4.29, _init 4.42, _count 4.23, _offsets 4.83, _scatter 4.38 us), so the
+# preamble is launch bound at ~22 us/layer -> ~2.0 ms/decode-step over 92 MoE
+# layers.  The module docstring already claims _init_kernel zeroes the count
+# buffer; it does not, torch.zeros does.  Closing that drift removes one launch
+# and one allocation per MoE layer per step (~0.4 ms/decode-step).
+#
+# The original ``_init_kernel`` and the default code path are left
+# byte-for-byte unchanged; the fused variant is a separate kernel selected only
+# when the switch is set.  Off by default; set
+# TSK_K3_MOE_ALIGN_FUSED_INIT=1 to enable.
+_ALIGN_FUSED_INIT = os.environ.get("TSK_K3_MOE_ALIGN_FUSED_INIT", "0") == "1"
 
 
 @gluon.jit
@@ -70,6 +92,36 @@ def _init_kernel(
     mask = offs < EM_max
     gl.store(sti_ptr + offs, gl.full([BLOCK], sentinel, gl.int32, layout=L), mask=mask)
     gl.store(sw_ptr + offs, gl.full([BLOCK], 0.0, gl.float32, layout=L), mask=mask)
+
+
+@gluon.jit
+def _init_zero_counts_kernel(
+    sti_ptr,
+    sw_ptr,
+    counts_ptr,
+    EM_max,
+    num_counts,
+    sentinel,
+    BLOCK: gl.constexpr,
+    NW: gl.constexpr,
+):
+    """``_init_kernel`` plus the ``counts`` zero-fill folded in.
+
+    Only used when TSK_K3_MOE_ALIGN_FUSED_INIT=1; the launcher guards on
+    ``num_counts <= BLOCK`` so CTA 0 covers the whole count buffer with the
+    block/layout this kernel already uses.  ``counts`` is consumed by
+    ``_count_kernel``, a strictly later launch on the same stream, so the
+    zero-fill is ordered ahead of every atomic that accumulates into it.
+    """
+    L: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    pid = gl.program_id(0)
+    offs = pid * BLOCK + gl.arange(0, BLOCK, layout=L)
+    mask = offs < EM_max
+    gl.store(sti_ptr + offs, gl.full([BLOCK], sentinel, gl.int32, layout=L), mask=mask)
+    gl.store(sw_ptr + offs, gl.full([BLOCK], 0.0, gl.float32, layout=L), mask=mask)
+    if pid == 0:
+        zeros = gl.full([BLOCK], 0.0, gl.float32, layout=L)
+        gl.store(counts_ptr + offs, zeros, mask=offs < num_counts)
 
 
 @gluon.jit
@@ -248,15 +300,32 @@ def moe_align_block_size_device(
     sei = torch.empty(nb_max, dtype=torch.int32, device=device)
     row_off = torch.empty(BLOCK_E, dtype=torch.int32, device=device)
     fill_ctr = torch.empty(BLOCK_E, dtype=torch.float32, device=device)
-    counts = torch.zeros(
-        BLOCK_E, dtype=torch.float32, device=device
-    )  # count_kernel accum
     meta = torch.empty(2, dtype=torch.int32, device=device)  # [EM, num_blocks]
 
     INIT_BLOCK = 1024
-    _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
-        sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4
-    )
+    # Fast path: fold the ``counts`` zero-fill into the init launch.  Requires
+    # the count buffer to fit inside CTA 0's block; otherwise fall through to
+    # the original two-op sequence.
+    if _ALIGN_FUSED_INIT and BLOCK_E <= INIT_BLOCK:
+        counts = torch.empty(BLOCK_E, dtype=torch.float32, device=device)
+        _init_zero_counts_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
+            sti,
+            sw,
+            counts,
+            EM_max,
+            BLOCK_E,
+            sentinel,
+            BLOCK=INIT_BLOCK,
+            NW=4,
+            num_warps=4,
+        )
+    else:
+        counts = torch.zeros(
+            BLOCK_E, dtype=torch.float32, device=device
+        )  # count_kernel accum
+        _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
+            sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4
+        )
     BLOCK_N = 1024
     _count_kernel[(triton.cdiv(N, BLOCK_N),)](
         exp_flat,

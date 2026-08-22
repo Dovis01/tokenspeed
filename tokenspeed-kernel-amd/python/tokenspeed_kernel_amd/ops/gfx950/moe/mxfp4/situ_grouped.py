@@ -31,6 +31,8 @@ locally-owned EP slots.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
@@ -55,6 +57,36 @@ GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
 # The constant stays instead of deleting the atomic path outright, so the
 # comparison is easy to redo if the padding ever stops dominating.
 GROUPED_ATOMIC_COMBINE_MAX_TOKENS = 0
+
+# --- TSK_K3_MOE_REDUCE_DECODE_GEOMETRY (default OFF) -------------------------
+# ``reduce_block_m=64`` / ``reduce_block_n=256`` below are prefill tuning.  At
+# decode shapes (num_tokens <= 64, hidden_dim 3584) that is a 14-workgroup grid
+# on a 256-CU MI355X, so ``_masked_topk_reduce_kernel`` is occupancy bound, not
+# bandwidth bound.  Measured GPU time per launch (torch.profiler, gfx950,
+# top_k=16, 112 local experts, hidden 3584):
+#
+#     num_tokens   (64,256) default   (16,128) tuned   speedup
+#              1        15.53 us          5.68 us       2.73x
+#              8        14.61 us          4.90 us       2.98x
+#             16        14.92 us          5.38 us       2.77x
+#             32        15.47 us          5.31 us       2.91x
+#
+# At 92 MoE layers that is ~0.94 ms off every decode step.  The kernel, its
+# ``static_range`` over TOP_K and its fp32 accumulation order are untouched --
+# only the tiling changes -- so the reduction is bit-identical.  Off by default;
+# set TSK_K3_MOE_REDUCE_DECODE_GEOMETRY=1 to enable.
+_REDUCE_TUNE_SMALL_M = (
+    os.environ.get("TSK_K3_MOE_REDUCE_DECODE_GEOMETRY", "0") == "1"
+)
+# Fast-path applicability bound, deliberately a module constant rather than a
+# second environment switch: it is the shape guard for the measurement above,
+# not an independent lever.  64 covers every captured decode size on this
+# deployment (--cudagraph-capture-sizes 1 2 4 8 16 32, --max-num-seqs 32) with
+# margin, and the four rows of the table above are all at or below it.  Anything
+# larger is prefill-shaped and falls through to the original (64, 256) tiling.
+_REDUCE_TUNE_MAX_TOKENS = 64
+_REDUCE_TUNE_BLOCK_M = 16
+_REDUCE_TUNE_BLOCK_N = 128
 
 
 @gluon.jit
@@ -892,6 +924,18 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         )
     reduce_block_m = 64
     reduce_block_n = 256
+    if (
+        _REDUCE_TUNE_SMALL_M
+        and num_tokens <= _REDUCE_TUNE_MAX_TOKENS
+        and hidden_dim % _REDUCE_TUNE_BLOCK_N == 0
+    ):
+        # Decode-shaped reduction. The (64, 256) tiling above is prefill
+        # tuning: at num_tokens <= 64 it yields a 14-workgroup grid on a
+        # 256-CU part, so the kernel is occupancy bound rather than
+        # bandwidth bound. Same kernel, same fp32 accumulation order over
+        # TOP_K -- only the tiling changes, so the result is bit-identical.
+        reduce_block_m = _REDUCE_TUNE_BLOCK_M
+        reduce_block_n = _REDUCE_TUNE_BLOCK_N
     reduce_grid = triton.cdiv(num_tokens, reduce_block_m) * triton.cdiv(
         hidden_dim, reduce_block_n
     )
