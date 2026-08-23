@@ -26,6 +26,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash2 import (
     DFlash2,
@@ -48,6 +49,24 @@ from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistributi
 def test_dflash2_architecture_dispatches_to_its_selector_runtime() -> None:
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
     assert get_drafter_impl("DFLASH", model) is DFlash2
+
+
+@pytest.mark.parametrize(
+    ("architecture", "attention_mode", "expected"),
+    (
+        ("DFlash2DraftModel", "mla", True),
+        ("DFlash2DraftModel", "gqa", False),
+        ("DFlashDraftModel", "mla", False),
+    ),
+)
+def test_dflash2_mla_attention_family_detection(
+    architecture: str, attention_mode: str, expected: bool
+) -> None:
+    config = SimpleNamespace(
+        architectures=[architecture],
+        dflash_config={"attention_mode": attention_mode},
+    )
+    assert _is_dflash2_mla(config, config) is expected
 
 
 def test_dflash_attention_uses_the_full_attention_cache_group() -> None:
