@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
@@ -53,6 +54,20 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
+
+
+def _ts_k3_switch(name: str) -> bool:
+    """Read a namespaced, default-OFF Kimi-K3 orchestration switch.
+
+    Every switch added by this module defaults to OFF so that, with no
+    ``TS_K3_*`` variable set, the selected orchestration is byte-for-byte the
+    upstream one. Names are namespaced with ``TS_K3_`` so they cannot collide
+    with an upstream variable.
+    """
+
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Projects hidden states to router logits, routed latent, and the unreduced
 # shared-expert partial in one pass, or returns None to use the modules.
 InputProjector = Callable[
@@ -197,6 +212,10 @@ class Kimi3MoEExecutionPlan:
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
+    # When set, the joint routed+shared reduction is issued over the MoE
+    # TP*EP group rather than the (possibly size-1) pure-EP group. Only ever
+    # set by the ``TS_K3_JOINT_MOE_REDUCE_TP`` switch below.
+    joint_reduce_over_tp_ep: bool = False
     fused_moe_ar: bool = False
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
@@ -231,22 +250,63 @@ class Kimi3MoEExecutionPlan:
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
+        # --- default-OFF switch: TS_K3_OVERLAP_SHARED_EXPERTS ---------------
+        # Upstream gates the shared-expert stream overlap on ``enforce_eager``
+        # AND ``tp_ep_size == 1``, which is unreachable on any multi-GPU
+        # deploy. ``LatentMoELayer.forward`` already refuses to fork while
+        # ``get_is_cuda_graph_phase()`` is true, so the capture-time deadlock
+        # the eager gate was protecting against is handled at the use site.
+        # This switch relaxes the construction-time gate to that runtime
+        # guard; it still requires the native path and a real aux stream.
+        overlap_shared_experts = (
+            use_native
+            and enforce_eager
+            and alt_stream is not None
+            and mapping.moe.tp_ep_size == 1
+        )
+        if not overlap_shared_experts and _ts_k3_switch("TS_K3_OVERLAP_SHARED_EXPERTS"):
+            overlap_shared_experts = use_native and alt_stream is not None
+
+        joint_moe_reduce = (
+            use_native
+            and mapping.moe.tp_size == 1
+            and mapping.moe.ep_size > 1
+            and mapping.moe.ep_group == mapping.moe.tp_ep_group
+        )
+        # --- default-OFF switch: TS_K3_JOINT_MOE_REDUCE_TP ------------------
+        # The joint reduction fuses the shared-expert H-width partial and the
+        # routed L-width partial into a single collective, and is the gate on
+        # the gfx950 FUSE_SHARED_DOWN fused decode pipeline. Upstream requires
+        # ``tp_size == 1``, so with the default ``ep_size == 1`` (making
+        # ``moe_tp_size == world_size``) it is dead on every multi-GPU deploy.
+        #
+        # Both partials are in fact reduced over the *same* group in that
+        # configuration -- ``K3MoeTailComm.reduce_shared`` and
+        # ``reduce_project_routed`` both all-reduce over ``moe.tp_ep_group`` --
+        # so fusing them is sound as long as the joint collective is issued
+        # over ``tp_ep_group`` and not over the size-1 pure-EP group. That is
+        # what ``joint_reduce_over_tp_ep`` plumbs through.
+        joint_reduce_over_tp_ep = False
+        if not joint_moe_reduce and _ts_k3_switch("TS_K3_JOINT_MOE_REDUCE_TP"):
+            # Fallback path: only take it for the shape this reasoning covers
+            # (pure MoE-TP, no expert parallelism). Anything else keeps the
+            # original orchestration and degrades in speed, not correctness.
+            if (
+                use_native
+                and mapping.moe.ep_size == 1
+                and mapping.moe.tp_size > 1
+                and mapping.moe.tp_size == mapping.moe.tp_ep_size
+            ):
+                joint_moe_reduce = True
+                joint_reduce_over_tp_ep = True
+
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
             use_marlin=use_marlin,
-            overlap_shared_experts=(
-                use_native
-                and enforce_eager
-                and alt_stream is not None
-                and mapping.moe.tp_ep_size == 1
-            ),
-            joint_moe_reduce=(
-                use_native
-                and mapping.moe.tp_size == 1
-                and mapping.moe.ep_size > 1
-                and mapping.moe.ep_group == mapping.moe.tp_ep_group
-            ),
+            overlap_shared_experts=overlap_shared_experts,
+            joint_moe_reduce=joint_moe_reduce,
+            joint_reduce_over_tp_ep=joint_reduce_over_tp_ep,
         )
 
     def prepare_latent_fusion(
@@ -478,6 +538,7 @@ class LatentMoELayer(nn.Module):
         joint_reduce: bool = False,
         shared_expert_stream: torch.cuda.Stream | None = None,
         expert_parallel_group: tuple[int, ...] | None = None,
+        joint_reduce_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
         input_projections: InputProjector | None = None,
     ) -> None:
@@ -510,7 +571,14 @@ class LatentMoELayer(nn.Module):
                     "expert_parallel_group size must match experts.ep_size: "
                     f"{len(expert_parallel_group)} != {expert_parallel_size}"
                 )
-        if joint_reduce and expert_parallel_group is None:
+        # The joint collective may need a wider group than the pure-EP one
+        # (see ``TS_K3_JOINT_MOE_REDUCE_TP``). Default is the EP group, so the
+        # unswitched behaviour is unchanged.
+        if joint_reduce_group is None:
+            joint_reduce_group = expert_parallel_group
+        else:
+            joint_reduce_group = tuple(joint_reduce_group)
+        if joint_reduce and joint_reduce_group is None:
             raise ValueError("joint_reduce requires expert_parallel_group")
         if expert_parallel_size > 1 and latent_reduce is None and not joint_reduce:
             if expert_parallel_group is None:
@@ -530,6 +598,7 @@ class LatentMoELayer(nn.Module):
         self.shared_reduce = shared_reduce
         self.joint_reduce = joint_reduce
         self.expert_parallel_group = expert_parallel_group
+        self.joint_reduce_group = joint_reduce_group
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
@@ -594,7 +663,7 @@ class LatentMoELayer(nn.Module):
             acquire_all_reduce_outputs(
                 (output_shape, (num_tokens, int(self.experts.hidden_size))),
                 hidden_states,
-                self.expert_parallel_group,
+                self.joint_reduce_group,
             )
             if self.joint_reduce and num_tokens > 0
             else None
@@ -716,7 +785,7 @@ class LatentMoELayer(nn.Module):
         if reduction_outputs is not None:
             shared_output, routed_latent = all_reduce(
                 reduction_outputs,
-                self.expert_parallel_group,
+                self.joint_reduce_group,
             )
             _check_shape(shared_output, output_shape, "joint shared output")
             _check_shape(routed_latent, latent_shape, "joint routed latent")

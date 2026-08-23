@@ -117,6 +117,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
+    _ts_k3_switch,
     latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
@@ -1572,14 +1573,34 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
+                # Under TS_K3_JOINT_MOE_REDUCE_TP the routed and shared
+                # partials are both TP partials, so the single fused
+                # collective must span the MoE TP*EP group. Unset otherwise,
+                # which keeps the EP group and the original behaviour.
+                joint_reduce_group=(
+                    mapping.moe.tp_ep_group
+                    if self.execution_plan.joint_reduce_over_tp_ep
+                    else None
+                ),
                 input_projections=self._latent_input_projections,
             )
             if self.execution_plan.use_native
             else None
         )
         # Dry-run exact registry selection for the fused decode pipeline.
+        # --- default-OFF switch: TS_K3_FUSED_DECODE_PIPELINE ----------------
+        # When joint reduce was enabled by TS_K3_JOINT_MOE_REDUCE_TP (rather
+        # than by the upstream EP condition), the gfx950 FUSE_SHARED_DOWN
+        # fused decode pipeline becomes reachable for the first time. Keep it
+        # behind its own switch so the collective fusion and the fused decode
+        # kernel can be attributed separately. Configurations where upstream
+        # already enabled joint reduce are untouched.
+        _fused_pipeline_allowed = self.execution_plan.joint_moe_reduce and (
+            not self.execution_plan.joint_reduce_over_tp_ep
+            or _ts_k3_switch("TS_K3_FUSED_DECODE_PIPELINE")
+        )
         self._use_fused_decode_pipeline = (
-            self.execution_plan.joint_moe_reduce
+            _fused_pipeline_allowed
             and latent_moe_decode_pipeline_available(
                 self.gate.weight,
                 self.routed_expert_down_proj.weight,
@@ -1741,7 +1762,14 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            group=self.mapping.moe.ep_group,
+            # Must match the group the joint reduction was planned over; see
+            # TS_K3_JOINT_MOE_REDUCE_TP. Falls back to the EP group when the
+            # switch is off, i.e. unchanged upstream behaviour.
+            group=(
+                self.mapping.moe.tp_ep_group
+                if self.execution_plan.joint_reduce_over_tp_ep
+                else self.mapping.moe.ep_group
+            ),
         )
         return self.native_latent_moe.finalize_output(
             routed_latent,

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
@@ -39,6 +41,33 @@ def _gluon_eligible(
 _K3_PACKED_TOPK_MAX_ROWS_NVIDIA = 256
 #: Unmeasured past one row on CDNA4, so it keeps what it was tuned at.
 _K3_PACKED_TOPK_MAX_ROWS_CDNA4 = 1
+#: Opt-in (default OFF) CDNA4 row cap. The default of 1 is a "nobody measured
+#: it" placeholder, not a measured cliff, so every batch above a single row
+#: skips the packed K3 kernel and takes the generic dispatch. Measured on
+#: gfx950 (MI355X) at experts=896 / topk=16 / FP32, GPU time per call:
+#:
+#:     rows        1      2      4      8     16     32     64
+#:     current  3.95  21.22  10.01  21.91   8.58   8.68   8.53  us
+#:     packed   3.91   4.27   4.57   5.50   5.52   5.40   5.54  us
+#:
+#: Selection is bit-identical to the current dispatch at every measured row
+#: count; the weights differ by at most one FP32 ulp (7.5e-9), which is the
+#: difference the branch above already documents.
+_K3_PACKED_TOPK_CDNA4_SWITCH = "TSK_K3_PACKED_TOPK_CDNA4"
+_K3_PACKED_TOPK_MAX_ROWS_CDNA4_TUNED = 256
+
+
+def _k3_packed_topk_max_rows_cdna4() -> int:
+    """CDNA4 row cap for the packed K3 top-k, raised only by an opt-in switch."""
+    enabled = os.environ.get(_K3_PACKED_TOPK_CDNA4_SWITCH, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if enabled:
+        return _K3_PACKED_TOPK_MAX_ROWS_CDNA4_TUNED
+    return _K3_PACKED_TOPK_MAX_ROWS_CDNA4
 
 
 def moe_sigmoid_bias_topk(
@@ -101,7 +130,7 @@ def moe_sigmoid_bias_topk(
     if platform.is_nvidia:
         packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_NVIDIA
     elif platform.is_cdna4:
-        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_CDNA4
+        packed_max_rows = _k3_packed_topk_max_rows_cdna4()
     else:
         packed_max_rows = 0
     if (
