@@ -16,6 +16,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 
+def test_kimi_k3_draft_mla_cache_retains_full_history() -> None:
+    """DFlash2 SWA changes compute visibility, never draft KV retention."""
+    num_draft_layers = 6
+    recipe = kimi_recipe(draft_layers=num_draft_layers)
+
+    assert recipe.group_ids[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    assert (
+        recipe.layer_types[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     text_config = KimiLinearConfig()
