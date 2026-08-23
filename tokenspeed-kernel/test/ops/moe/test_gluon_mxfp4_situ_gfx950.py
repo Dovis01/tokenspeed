@@ -36,6 +36,148 @@ if not is_cdna4():
 import tokenspeed_kernel  # noqa: E402
 
 
+def _make_kimi_align_inputs(
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    top_k = 16
+    num_local_experts = 112
+    expert_start = 3 * num_local_experts
+    token = torch.arange(num_tokens, device="cuda", dtype=torch.int32)[:, None]
+    slot = torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+    local_ids = expert_start + (token * 3 + slot * 7) % num_local_experts
+    remote_ids = (token * 5 + slot * 11) % expert_start
+    topk_ids = torch.where((slot % 2) == 0, local_ids, remote_ids).contiguous()
+    topk_weights = (
+        torch.arange(1, num_tokens * top_k + 1, device="cuda", dtype=torch.float32)
+        .reshape(num_tokens, top_k)
+        .div_(num_tokens * top_k + 1)
+    )
+    return topk_ids, topk_weights, num_local_experts, expert_start
+
+
+def _assert_kimi_align_contract(
+    result: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local_experts: int,
+    expert_start: int,
+) -> None:
+    sorted_ids, sorted_experts, sorted_weights, num_valid = result
+    num_tokens, top_k = topk_ids.shape
+    block_m = 64
+    max_blocks = min(num_tokens * top_k, num_local_experts)
+    assert sorted_ids.shape == (max_blocks * block_m,)
+    assert sorted_experts.shape == (max_blocks,)
+    assert sorted_weights.shape == sorted_ids.shape
+    valid_rows = int(num_valid.item())
+    assert valid_rows % block_m == 0
+    num_blocks = valid_rows // block_m
+
+    ids_cpu = topk_ids.cpu()
+    weights_cpu = topk_weights.cpu()
+    sorted_ids_cpu = sorted_ids.cpu()
+    sorted_experts_cpu = sorted_experts.cpu()
+    sorted_weights_cpu = sorted_weights.cpu()
+    expected_routes = {
+        (token, slot)
+        for token in range(num_tokens)
+        for slot in range(top_k)
+        if expert_start <= int(ids_cpu[token, slot]) < expert_start + num_local_experts
+    }
+    expected_experts = sorted(
+        {int(ids_cpu[token, slot]) - expert_start for token, slot in expected_routes}
+    )
+    assert valid_rows == len(expected_experts) * block_m
+    assert sorted_experts_cpu[:num_blocks].tolist() == expected_experts
+    assert torch.all(sorted_experts_cpu[num_blocks:] == -1)
+
+    actual_routes: set[tuple[int, int]] = set()
+    for block, local_expert in enumerate(expected_experts):
+        real_rows = 0
+        for row in range(block * block_m, (block + 1) * block_m):
+            packed = int(sorted_ids_cpu[row])
+            token = packed & 0xFFFFFF
+            if token == num_tokens:
+                assert float(sorted_weights_cpu[row]) == 0.0
+                continue
+            slot = packed >> 24
+            assert 0 <= token < num_tokens
+            assert 0 <= slot < top_k
+            assert int(ids_cpu[token, slot]) == expert_start + local_expert
+            assert sorted_weights_cpu[row] == weights_cpu[token, slot]
+            assert (token, slot) not in actual_routes
+            actual_routes.add((token, slot))
+            real_rows += 1
+        assert real_rows == sum(
+            int(ids_cpu[token, slot]) == expert_start + local_expert
+            for token, slot in expected_routes
+        )
+    assert actual_routes == expected_routes
+
+
+@pytest.mark.parametrize("num_tokens", [16, 32, 64])
+def test_fused_lds_align_matches_kimi_ep_contract_gfx950(num_tokens: int) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
+        moe_align_block_size_fused,
+    )
+
+    topk_ids, topk_weights, num_local_experts, expert_start = _make_kimi_align_inputs(
+        num_tokens
+    )
+    result = moe_align_block_size_fused(
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+        64,
+        expert_start=expert_start,
+    )
+    _assert_kimi_align_contract(
+        result,
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+        expert_start,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [32, 64])
+def test_fused_lds_align_is_cuda_graph_capturable_gfx950(num_tokens: int) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
+        moe_align_block_size_fused,
+    )
+
+    topk_ids, topk_weights, num_local_experts, expert_start = _make_kimi_align_inputs(
+        num_tokens
+    )
+
+    def align():
+        return moe_align_block_size_fused(
+            topk_ids,
+            topk_weights,
+            num_local_experts,
+            64,
+            expert_start=expert_start,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            align()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = align()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_kimi_align_contract(
+        captured,
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+        expert_start,
+    )
+
+
 def _make_mxfp4_module(
     *,
     num_experts: int,
@@ -66,7 +208,7 @@ def _make_mxfp4_module(
     return module, raw
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32, 64])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
 ) -> None:
@@ -161,7 +303,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32, 64])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(
     num_tokens: int,
 ) -> None:
@@ -532,7 +674,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32, 64])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,

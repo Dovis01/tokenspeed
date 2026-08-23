@@ -39,6 +39,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
     moe_align_block_size_device,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
+    FUSED_ALIGN_MAX_ROUTES,
     moe_align_block_size_fused,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused_ep import (
@@ -48,23 +49,15 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused_ep import (
 MXFP4_GROUP_SIZE = 32
 _MXFP4_GROUP_SIZE_GL = gl.constexpr(32)
 GROUPED_BLOCK_M = 64
-GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-# Opt-in (default OFF): route the decode-shaped align through the single-kernel
-# expert-parallel implementation instead of the five-launch device path.
-# ``moe_align_block_size_fused`` above is capped at 128 routes because it does
-# O(M*topk*block_m) init and an O((M*topk)^2) rank tile inside ONE workgroup;
-# the decode shape here is M=32, topk=16 -> 512 routes, so it falls back to the
-# five-launch path (_init + torch.zeros memset + _count + single-CTA _offsets +
-# _scatter).  The expert-parallel variant keeps the single-block collapse (which
-# needs only M <= block_m) and parallelizes the rank over experts, so it holds
-# at 512 routes.  Measured on gfx950 at M=32/topk=16/E=112/block_m=64:
-# 12.5us -> 3.7us of GPU time per MoE layer.
+# Opt-in fallback for route counts beyond the primary fused aligner's bound.
+# The expert-parallel implementation keeps the single-block collapse and
+# parallelizes route ranking over experts through 2,048 routes.
 _ALIGN_EP_SWITCH = "TSK_AMD_MOE_ALIGN_EXPERT_PARALLEL"
 # Fallback guards: one workgroup per local expert, each holding a
 # next_pow2(M*topk) route tile in registers.  Outside these bounds the original
@@ -870,7 +863,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         )
 
     num_routes = num_tokens * top_k
-    if 0 < num_routes <= GROUPED_FUSED_ALIGN_MAX_ROUTES and num_tokens <= block_m:
+    if 0 < num_routes <= FUSED_ALIGN_MAX_ROUTES and num_tokens <= block_m:
         align = moe_align_block_size_fused
     elif (
         _env_flag(_ALIGN_EP_SWITCH)

@@ -18,10 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused small-M MoE block-align (decode): single-kernel, sync-free, pure Gluon.
+"""Fused small-M MoE block-align (decode): single-kernel, pure Gluon.
 
-A single workgroup doing O(num_experts) work, in Gluon (which has no LDS int
-atomics). One kernel:
+Both paths use one workgroup and preserve the same block-alignment contract:
 
   * in-kernel sentinel/zero init of the output + ``gl.barrier`` (folds away the
     separate init-kernel launch),
@@ -31,19 +30,24 @@ atomics). One kernel:
     token, so at M <= block_m, count[e] <= M <= block_m and every hit expert is
     exactly one block. So blocks_pe = (count>0), row_off = block_off*block_m, and
     ``sorted_expert_ids`` is a cheap O(E) scatter (no [NB, E] tile),
-  * a [G, G] compare-tile stable rank (no atomics),
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
     ``block_off[e]*block_m + rank``.
 
-Sync-free: outputs sized at the compile-time bound ``EM_MAX = (M*topk)*block_m``;
-``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
-tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
+At up to 128 routes, a [G, G] comparison tile computes stable per-expert ranks.
+Above that, explicit LDS counters compute the same ranks in O(G + E) work. The
+atomic route order is unspecified, as in the scalable multi-kernel align path.
+
+Outputs retain static capacities for graph capture; ``num_valid`` (real padded
+extent) stays on-device and the GEMM stages early-out on the unused tail.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+
+FUSED_ALIGN_QUADRATIC_MAX_ROUTES = 128
+FUSED_ALIGN_MAX_ROUTES = 1024
 
 
 def _next_pow2(x: int) -> int:
@@ -147,6 +151,116 @@ def _fused_align_kernel(
     gl.store(sw_ptr + dest, vals, mask=route_mask)
 
 
+@gluon.jit
+def _fused_align_lds_kernel(
+    ids_ptr,  # [G] int32 flat topk_ids
+    wts_ptr,  # [G] fp32 flat topk_weights
+    sti_ptr,  # [EM_MAX] int32 out (packed slot<<24|token)
+    sw_ptr,  # [EM_MAX] fp32 out (routed weight)
+    sei_ptr,  # [NB_MAX] int32 out (expert per block, -1 pad)
+    nv_ptr,  # [1] int32 out (padded active extent)
+    G,
+    num_experts,
+    sentinel,
+    TOPK: gl.constexpr,
+    GP: gl.constexpr,
+    EP: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NB_MAX: gl.constexpr,
+    EM_MAX: gl.constexpr,
+    INIT_TILE: gl.constexpr,
+):
+    route_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    init_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    counter_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[EP, 1]], [EP], [0]
+    )
+    counters = gl.allocate_shared_memory(gl.int32, [EP], counter_shared_layout)
+    counter_zeros = gl.zeros([EP], gl.int32, layout=expert_layout)
+
+    expert = gl.arange(0, EP, layout=expert_layout)
+    gl.store(
+        sei_ptr + expert,
+        gl.full([EP], -1, gl.int32, layout=expert_layout),
+        mask=expert < NB_MAX,
+    )
+    counters.store(counter_zeros)
+    gl.barrier()
+
+    route = gl.arange(0, GP, layout=route_layout)
+    route_in_bounds = route < G
+    global_expert = gl.load(
+        ids_ptr + route,
+        mask=route_in_bounds,
+        other=EXPERT_START + num_experts,
+    )
+    local_expert = global_expert - EXPERT_START
+    local_route = route_in_bounds & (local_expert >= 0) & (local_expert < num_experts)
+    safe_expert = gl.where(local_route, local_expert, 0).to(gl.int32)
+    counters.atomic_scatter_add(
+        gl.full([GP], 1, gl.int32, layout=route_layout),
+        safe_expert,
+        axis=0,
+        mask=local_route,
+    )
+    gl.barrier()
+
+    counts = counters.load(expert_layout)
+    valid_expert = expert < num_experts
+    hit = valid_expert & (counts > 0)
+    blocks_per_expert = hit.to(gl.int32)
+    block_offset = gl.associative_scan(blocks_per_expert, 0, _add) - blocks_per_expert
+    num_blocks = gl.sum(blocks_per_expert, 0)
+    gl.store(nv_ptr, num_blocks * BLOCK_M)
+    gl.store(sei_ptr + block_offset, expert.to(gl.int32), mask=hit)
+
+    # Only the padded active prefix is consumed downstream. Initialize that
+    # dynamic prefix rather than the larger graph-capture allocation bound.
+    active_rows = num_blocks * BLOCK_M
+    for row_start in gl.static_range(0, EM_MAX, INIT_TILE):
+        row = row_start + gl.arange(0, INIT_TILE, layout=init_layout)
+        row_mask = row < active_rows
+        gl.store(
+            sti_ptr + row,
+            gl.full([INIT_TILE], sentinel, gl.int32, layout=init_layout),
+            mask=row_mask,
+        )
+        gl.store(
+            sw_ptr + row,
+            gl.full([INIT_TILE], 0.0, gl.float32, layout=init_layout),
+            mask=row_mask,
+        )
+
+    # Reuse the histogram as per-expert reservation counters. Each real route
+    # receives one unique row in its expert's block; route order is immaterial.
+    counters.store(counter_zeros)
+    gl.barrier()
+    global_expert = gl.load(
+        ids_ptr + route,
+        mask=route_in_bounds,
+        other=EXPERT_START + num_experts,
+    )
+    local_expert = global_expert - EXPERT_START
+    local_route = route_in_bounds & (local_expert >= 0) & (local_expert < num_experts)
+    safe_expert = gl.where(local_route, local_expert, 0).to(gl.int32)
+    expert_row = counters.atomic_scatter_add(
+        gl.full([GP], 1, gl.int32, layout=route_layout),
+        safe_expert,
+        axis=0,
+        mask=local_route,
+    )
+    first_row = gl.gather(block_offset, safe_expert, axis=0) * BLOCK_M
+    destination = first_row + expert_row
+    token = route // TOPK
+    slot = route % TOPK
+    packed = ((slot << 24) | token).to(gl.int32)
+    weight = gl.load(wts_ptr + route, mask=local_route, other=0.0)
+    gl.store(sti_ptr + destination, packed, mask=local_route)
+    gl.store(sw_ptr + destination, weight, mask=local_route)
+
+
 def moe_align_block_size_fused(
     topk_ids: torch.Tensor,  # [M, topk] int
     topk_weights: torch.Tensor,  # [M, topk] float
@@ -171,7 +285,12 @@ def moe_align_block_size_fused(
     sentinel = M
     assert M <= block_m, f"fused small-M align needs M ({M}) <= block_m ({block_m})"
 
-    NB_MAX = G
+    # Preserve the original generic fallback outside the bounded LDS path;
+    # Kimi's grouped caller only selects this function through MAX_ROUTES.
+    use_quadratic_rank = not (
+        FUSED_ALIGN_QUADRATIC_MAX_ROUTES < G <= FUSED_ALIGN_MAX_ROUTES
+    )
+    NB_MAX = G if use_quadratic_rank else min(G, num_experts)
     EM_MAX = NB_MAX * block_m
     GP = _next_pow2(G)
     EP = _next_pow2(num_experts)
@@ -183,24 +302,46 @@ def moe_align_block_size_fused(
     sei = torch.empty(NB_MAX, dtype=torch.int32, device=device)
     nv = torch.empty(1, dtype=torch.int32, device=device)
 
-    _fused_align_kernel[(1,)](
-        ids,
-        wts,
-        sti,
-        sw,
-        sei,
-        nv,
-        G,
-        num_experts,
-        block_m,
-        sentinel,
-        TOPK=topk,
-        GP=GP,
-        EP=EP,
-        EXPERT_START=expert_start,
-        NB_MAX=NB_MAX,
-        EM_MAX=EM_MAX,
-        INIT_TILE=_next_pow2(min(1024, EM_MAX)),
-        num_warps=4,
-    )
+    if use_quadratic_rank:
+        _fused_align_kernel[(1,)](
+            ids,
+            wts,
+            sti,
+            sw,
+            sei,
+            nv,
+            G,
+            num_experts,
+            block_m,
+            sentinel,
+            TOPK=topk,
+            GP=GP,
+            EP=EP,
+            EXPERT_START=expert_start,
+            NB_MAX=NB_MAX,
+            EM_MAX=EM_MAX,
+            INIT_TILE=_next_pow2(min(1024, EM_MAX)),
+            num_warps=4,
+        )
+    else:
+        _fused_align_lds_kernel[(1,)](
+            ids,
+            wts,
+            sti,
+            sw,
+            sei,
+            nv,
+            G,
+            num_experts,
+            sentinel,
+            TOPK=topk,
+            GP=GP,
+            EP=EP,
+            EXPERT_START=expert_start,
+            BLOCK_M=block_m,
+            NB_MAX=NB_MAX,
+            EM_MAX=EM_MAX,
+            INIT_TILE=_next_pow2(min(1024, EM_MAX)),
+            num_warps=4,
+        )
     return sti, sei, sw, nv
