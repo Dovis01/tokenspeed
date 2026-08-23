@@ -39,6 +39,8 @@ from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
     DFlashGroupedConv,
+    _dflash2_mla_rope,
+    _dflash2_uses_mla,
     _grouped_conv,
     _score_edges,
 )
@@ -67,6 +69,36 @@ def test_dflash2_mla_attention_family_detection(
         dflash_config={"attention_mode": attention_mode},
     )
     assert _is_dflash2_mla(config, config) is expected
+
+
+def test_dflash2_mla_model_mode_and_yarn_config() -> None:
+    config = SimpleNamespace(
+        dflash_config={"attention_mode": "mla"},
+        rope_theta=1_000_000.0,
+        rope_parameters={
+            "rope_type": "yarn",
+            "rope_theta": 50_000.0,
+            "factor": 32.0,
+            "original_max_position_embeddings": 32768,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        },
+    )
+
+    assert _dflash2_uses_mla(config)
+    rope_theta, scaling = _dflash2_mla_rope(config)
+    assert rope_theta == 50_000.0
+    assert scaling == {
+        "rope_type": "deepseek_yarn",
+        "factor": 32.0,
+        "original_max_position_embeddings": 32768,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+    }
 
 
 def test_dflash_attention_uses_the_full_attention_cache_group() -> None:
