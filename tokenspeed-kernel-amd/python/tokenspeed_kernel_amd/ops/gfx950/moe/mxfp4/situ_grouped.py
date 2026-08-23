@@ -88,6 +88,48 @@ _REDUCE_TUNE_MAX_TOKENS = 64
 _REDUCE_TUNE_BLOCK_M = 16
 _REDUCE_TUNE_BLOCK_N = 128
 
+# --- TSK_K3_MOE_GROUPED_SMALL_M_WARPS (default OFF) --------------------------
+# ``s1_warps = {64: 4, 128: 8}[block_m]`` and ``s2_warps = 4`` below tie the
+# warp count of both expert GEMMs to the row tile.  The BM64 arm of that table
+# is the small-M regime -- every decode step and every prefill chunk below
+# 3584 tokens -- and there four warps is the wrong choice: at BM64 the block
+# is padded out to a full 64 rows per touched expert, so the kernel streams
+# MXFP4 expert weights for ~60 experts to consume a handful of real routes and
+# is weight-fetch bound, not row bound.  Eight warps issue twice as many
+# outstanding global loads per CTA and cover more of that latency.
+#
+# Measured on this host (gfx950, HIP_VISIBLE_DEVICES=0, median of 30 reps
+# after 5 warmups), full grouped path -- align + stage1 + stage2 + reduce --
+# at the live EP8 shapes (latent 3584, intermediate 3072, 112 local experts,
+# top_k 16), microseconds:
+#
+#     tokens   4 warps    8 warps   delta
+#          1     211.0      198.4   -6.0%
+#          8     267.9      258.6   -3.5%
+#         16     341.8      320.1   -6.3%
+#         32     584.2      566.6   -3.0%     <- --max-num-seqs 32 decode
+#         64     676.7      653.1   -3.5%
+#        512     964.1      938.1   -2.7%
+#       1024     995.3      948.4   -4.7%
+#       2048    1101.8     1043.3   -5.3%
+#       3072    1264.0     1204.0   -4.7%
+#
+# Isolated per kernel at 32 tokens: stage 1 307.2 -> 295.5 us (-3.8%),
+# stage 2 168.5 -> 163.8 us (-2.8%).  The output was compared element-wise
+# against the four-warp result at every size above and is **bit-identical**
+# (max abs err 0.0): num_warps changes only how the fixed BLOCK_M x BLOCK_N
+# tile is partitioned across warps of the MFMA layout, not the tile shape, the
+# K-loop trip count, or the FP32 accumulation order.
+#
+# The BM128 arm is deliberately untouched: at block_m=128 stage 1 already runs
+# eight warps, and stage 2 at eight warps measured *slower* there (4096
+# tokens: 434.6 -> 509.1 us), so the fast path guards on ``block_m == 64`` and
+# every other shape falls through to the original table.  Off by default; set
+# TSK_K3_MOE_GROUPED_SMALL_M_WARPS=1 to enable.
+_SMALL_M_WARPS = os.environ.get("TSK_K3_MOE_GROUPED_SMALL_M_WARPS", "0") == "1"
+_SMALL_M_WARPS_BLOCK_M = 64
+_SMALL_M_WARPS_COUNT = 8
+
 
 @gluon.jit
 def _dequant_mxfp4_tile(
@@ -825,6 +867,11 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     s1_block_n = 64
     s1_block_k = 64
     s1_warps = {64: 4, 128: 8}[block_m]
+    if _SMALL_M_WARPS and block_m == _SMALL_M_WARPS_BLOCK_M:
+        # Small-M arm: weight-fetch bound, so widen the CTA rather than the
+        # tile. Same BLOCK_M/BLOCK_N/BLOCK_K and the same K-loop, so the
+        # result is bit-identical to the four-warp schedule.
+        s1_warps = _SMALL_M_WARPS_COUNT
     s1_grid = triton.cdiv(em, block_m) * triton.cdiv(intermediate, s1_block_n)
     _grouped_a16w4_situ_stage1_kernel[(s1_grid,)](
         hidden_states,
@@ -877,7 +924,12 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     s2_block_n = 128
     s2_block_k = 64
     s2_warps = 4
-    s2_grid = triton.cdiv(em, block_m) * triton.cdiv(hidden_dim, s2_block_n)
+    if _SMALL_M_WARPS and block_m == _SMALL_M_WARPS_BLOCK_M:
+        # Same reasoning as stage 1. Guarded on BM64: at block_m=128 eight
+        # warps measured slower here (4096 tokens, 434.6 -> 509.1 us), so the
+        # large-M shape keeps the original four.
+        s2_warps = _SMALL_M_WARPS_COUNT
+    s2_grid =triton.cdiv(em, block_m) * triton.cdiv(hidden_dim, s2_block_n)
     _grouped_a16w4_stage2_kernel[(s2_grid,)](
         inter,
         w2_weight,
