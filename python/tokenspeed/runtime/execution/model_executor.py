@@ -438,6 +438,9 @@ class ModelExecutor:
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
+            wire_sampling_backend = getattr(self.drafter, "wire_sampling_backend", None)
+            if wire_sampling_backend is not None:
+                wire_sampling_backend(self.sampling_backend)
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
@@ -722,6 +725,7 @@ class ModelExecutor:
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
+        draft_distribution=None,
     ):
         if self.drafter is None:
             return self.sampling_backend.sample(logits_output, sampling_info)
@@ -734,7 +738,7 @@ class ModelExecutor:
 
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
-                logits_output, sampling_info, candidates
+                logits_output, sampling_info, candidates, draft_distribution
             )
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
@@ -748,7 +752,10 @@ class ModelExecutor:
         )
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
-            decode_out, sampling_info[num_extends:], candidates
+            decode_out,
+            sampling_info[num_extends:],
+            candidates,
+            draft_distribution,
         )
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
@@ -851,12 +858,22 @@ class ModelExecutor:
             if self.config.spec_algo is not None
             else None
         )
+        draft_distribution = (
+            self.drafter.get_draft_distribution(ctx)
+            if self.drafter is not None
+            and hasattr(self.drafter, "get_draft_distribution")
+            else None
+        )
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
 
         output_tokens, accept_lengths = self._run_sampling(
-            logits_output, sampling_info, ctx, candidates
+            logits_output,
+            sampling_info,
+            ctx,
+            candidates,
+            draft_distribution,
         )
 
         # Backstop: flag any request whose sampled id falls outside [0, vocab)

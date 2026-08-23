@@ -55,6 +55,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     slice_dp_vocab_mask,
 )
+from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistribution
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
@@ -82,6 +83,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = True
+    dflash2_verify_mode = "rejection"
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -231,6 +233,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._final_coins_buf = torch.zeros(
             (max_pad_bs,), dtype=torch.float32, device=config.device
         )
+        self._draft_coins_buf = torch.zeros(
+            (max_pad_bs, max(max_n - 1, 1)),
+            dtype=torch.float32,
+            device=config.device,
+        )
 
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
         self._capture_gen = torch.Generator(device=config.device)
@@ -281,10 +288,16 @@ class FlashInferSamplingBackend(SamplingBackend):
         if request_pool_indices is None:
             self._coins_buf[:bs, :n].uniform_(lo, 1.0, generator=self._capture_gen)
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
+            self._draft_coins_buf[:bs, : max(n - 1, 1)].uniform_(
+                lo, 1.0, generator=self._capture_gen
+            )
             return
 
         cpu_coins = torch.empty((bs, n), dtype=torch.float32, pin_memory=True)
         cpu_final = torch.empty((bs,), dtype=torch.float32, pin_memory=True)
+        cpu_draft = torch.empty(
+            (bs, max(n - 1, 1)), dtype=torch.float32, pin_memory=True
+        )
 
         for i, pool_idx in enumerate(request_pool_indices):
             gen = self._cpu_generator_per_slot[pool_idx]
@@ -295,9 +308,27 @@ class FlashInferSamplingBackend(SamplingBackend):
                 )
             cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
             cpu_final[i].uniform_(lo, 1.0, generator=gen)
+            cpu_draft[i].uniform_(lo, 1.0, generator=gen)
 
         self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
         self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
+        self._draft_coins_buf[:bs, : max(n - 1, 1)].copy_(cpu_draft, non_blocking=True)
+
+    def dflash2_proposal_state(
+        self,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+        num_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_steps > self._draft_coins_buf.shape[1]:
+            raise ValueError(
+                f"DFlash2 needs {num_steps} proposal coins but the sampler "
+                f"allocated {self._draft_coins_buf.shape[1]}"
+            )
+        temperatures = self._temperature_pool.index_select(
+            0, req_pool_indices[:batch_size]
+        )
+        return temperatures, self._draft_coins_buf[:batch_size, :num_steps]
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
@@ -366,6 +397,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        draft_distribution: SparseDraftDistribution | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]
@@ -410,9 +442,25 @@ class FlashInferSamplingBackend(SamplingBackend):
                 pool_indices = torch.nn.functional.pad(
                     sampling_info.req_pool_indices, (0, pad_bs - effective_bs)
                 )[shard]
+                if draft_distribution is not None:
+                    draft_distribution = SparseDraftDistribution(
+                        candidate_ids=torch.nn.functional.pad(
+                            draft_distribution.candidate_ids,
+                            (0, 0, 0, 0, 0, pad_bs - effective_bs),
+                        )[shard],
+                        probabilities=torch.nn.functional.pad(
+                            draft_distribution.probabilities,
+                            (0, 0, 0, 0, 0, pad_bs - effective_bs),
+                        )[shard],
+                    )
             else:
                 candidates = candidates[shard]
                 pool_indices = sampling_info.req_pool_indices[shard]
+                if draft_distribution is not None:
+                    draft_distribution = SparseDraftDistribution(
+                        candidate_ids=draft_distribution.candidate_ids[shard],
+                        probabilities=draft_distribution.probabilities[shard],
+                    )
             vocab_mask = slice_dp_vocab_mask(
                 vocab_mask,
                 full_bs=effective_bs,
@@ -517,20 +565,36 @@ class FlashInferSamplingBackend(SamplingBackend):
                 )
             target_probs = target_probs.reshape(bs, n, -1)
 
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=None,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
-                enable_pdl=pdl_enabled(),
-            )
+            if draft_distribution is None:
+                chain_speculative_sampling_target_only(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=None,
+                    threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                    threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                    deterministic=not dp_sampling,
+                    enable_pdl=pdl_enabled(),
+                )
+            else:
+                from tokenspeed.runtime.sampling.dflash2 import (
+                    verify_sparse_draft_distribution,
+                )
+
+                verify_sparse_draft_distribution(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    target_probs=target_probs,
+                    draft_distribution=draft_distribution,
+                    acceptance_coins=coins[:bs, : n - 1],
+                    final_coins=final_coins[:bs],
+                )
 
         accept_length += 1
         logprobs_local = None

@@ -30,6 +30,7 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
+    from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistribution
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -118,6 +119,7 @@ class SamplingBackend(ABC):
     # a no-op.
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
+    dflash2_verify_mode = "unsupported"
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -269,6 +271,17 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
+    def dflash2_proposal_state(
+        self,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+        num_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-row temperatures and independent proposal coins."""
+        raise RuntimeError(
+            f"{type(self).__name__} does not support stochastic DFlash2 proposals"
+        )
+
     @abstractmethod
     def sample(
         self,
@@ -282,4 +295,5 @@ class SamplingBackend(ABC):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        draft_distribution: SparseDraftDistribution | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...

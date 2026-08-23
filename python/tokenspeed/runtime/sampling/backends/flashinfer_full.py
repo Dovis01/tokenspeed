@@ -58,6 +58,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistribution
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -369,6 +370,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        draft_distribution: SparseDraftDistribution | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]
@@ -445,20 +447,36 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[:bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[:bs]
 
-        chain_speculative_sampling_target_only(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=None,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=True,
-            enable_pdl=pdl_enabled(),
-        )
+        if draft_distribution is None:
+            chain_speculative_sampling_target_only(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates.to(torch.int32),
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=None,
+                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                deterministic=True,
+                enable_pdl=pdl_enabled(),
+            )
+        else:
+            from tokenspeed.runtime.sampling.dflash2 import (
+                verify_sparse_draft_distribution,
+            )
+
+            verify_sparse_draft_distribution(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates,
+                target_probs=target_probs,
+                draft_distribution=draft_distribution,
+                acceptance_coins=coins[:, : num_tokens_per_req - 1],
+                final_coins=coins_for_final_sampling,
+            )
 
         accept_length += 1
 

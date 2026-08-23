@@ -41,6 +41,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistribution
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -121,6 +122,7 @@ def _verify_chain_greedy(
 
 
 class GreedySamplingBackend(SamplingBackend):
+    dflash2_verify_mode = "greedy"
     """Greedy-only backend: argmax for single-step, chain-greedy verify for
     multi-step verification. No flashinfer / min_p / penalty machinery, no
     coin buffers. Verify uses the fused CUDA kernel when available; falls
@@ -198,6 +200,7 @@ class GreedySamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        draft_distribution: SparseDraftDistribution | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]

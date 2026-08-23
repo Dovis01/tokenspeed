@@ -69,6 +69,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.draft_distribution import SparseDraftDistribution
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -485,7 +486,13 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        draft_distribution: SparseDraftDistribution | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if draft_distribution is not None:
+            raise RuntimeError(
+                "TritonFullSamplingBackend does not yet implement DFlash2 q "
+                "rejection; use --sampling-backend flashinfer or flashinfer_full"
+            )
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
