@@ -253,6 +253,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
+        self.layer_id = int(layer_id)
         self._uses_mla = _dflash2_uses_mla(config)
         self.comm_manager = None
         if self._uses_mla:
@@ -320,6 +321,12 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # Borrowed vocab-parallel embeddings are shard-local partials. The
+            # grouped conv needs a complete hidden row, while every later layer
+            # already receives the all-reduced output of the preceding MLP
+            # conv. Reduce exactly once, at the first draft layer.
+            if self.layer_id == 0 and self.mapping.dense.tp_size > 1:
+                hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
