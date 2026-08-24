@@ -1835,6 +1835,8 @@ def try_kda_fused_paged_verify(
                 "paged_state": True,
                 "store_states": store_states,
                 "recurrent_layout": recurrent_layout,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
             },
             solution=solution,
             override=override,

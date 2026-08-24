@@ -216,6 +216,8 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "paged_state": True,
         "store_states": store_states,
         "recurrent_layout": recurrent_layout,
+        "num_heads": 1,
+        "head_dim": 1,
     }
     assert selected == expected
 
@@ -312,6 +314,25 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None, kernel_name
     assert spec.traits == expected_traits, kernel_name
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "gluon_kda_fused_paged_verify_vmajor_gfx950",
+        "gluon_kda_fused_paged_verify_vmajor_gfx1250",
+    ],
+)
+def test_amd_kda_fused_verify_registration_traits(kernel_name) -> None:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    assert spec is not None
+    assert spec.traits == {
+        "paged_state": frozenset({True}),
+        "store_states": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "num_heads": frozenset({12}),
+        "head_dim": frozenset({128}),
+    }
 
 
 @pytest.mark.parametrize(
