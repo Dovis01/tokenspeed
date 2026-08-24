@@ -24,12 +24,11 @@ Both paths use one workgroup and preserve the same block-alignment contract:
 
   * in-kernel sentinel/zero init of the output + ``gl.barrier`` (folds away the
     separate init-kernel launch),
-  * EP localization from global expert IDs plus ``gl.histogram`` -> per-expert
-    counts (remote routes are masked; EP = num_experts, no dump bin),
-  * **single-block collapse**: top-k contains each expert at most once per
-    token, so at M <= block_m, count[e] <= M <= block_m and every hit expert is
-    exactly one block. So blocks_pe = (count>0), row_off = block_off*block_m, and
-    ``sorted_expert_ids`` is a cheap O(E) scatter (no [NB, E] tile),
+  * EP localization from global expert IDs plus per-expert route counts (remote
+    routes are masked; EP = num_experts, no dump bin),
+  * the quadratic path emits one block per hit expert when ``M <= block_m``;
+    the LDS path emits ``ceil(count[e] / block_m)`` blocks and supports up to
+    two blocks per expert,
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
     ``block_off[e]*block_m + rank``.
 
@@ -167,6 +166,7 @@ def _fused_align_lds_kernel(
     EP: gl.constexpr,
     EXPERT_START: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    MAX_BLOCKS_PER_EXPERT: gl.constexpr,
     NB_MAX: gl.constexpr,
     EM_MAX: gl.constexpr,
     INIT_TILE: gl.constexpr,
@@ -181,11 +181,13 @@ def _fused_align_lds_kernel(
     counter_zeros = gl.zeros([EP], gl.int32, layout=expert_layout)
 
     expert = gl.arange(0, EP, layout=expert_layout)
-    gl.store(
-        sei_ptr + expert,
-        gl.full([EP], -1, gl.int32, layout=expert_layout),
-        mask=expert < NB_MAX,
-    )
+    for block_start in gl.static_range(0, NB_MAX, INIT_TILE):
+        block = block_start + gl.arange(0, INIT_TILE, layout=init_layout)
+        gl.store(
+            sei_ptr + block,
+            gl.full([INIT_TILE], -1, gl.int32, layout=init_layout),
+            mask=block < NB_MAX,
+        )
     counters.store(counter_zeros)
     gl.barrier()
 
@@ -210,11 +212,16 @@ def _fused_align_lds_kernel(
     counts = counters.load(expert_layout)
     valid_expert = expert < num_experts
     hit = valid_expert & (counts > 0)
-    blocks_per_expert = hit.to(gl.int32)
+    blocks_per_expert = gl.where(hit, gl.cdiv(counts, BLOCK_M), 0)
     block_offset = gl.associative_scan(blocks_per_expert, 0, _add) - blocks_per_expert
     num_blocks = gl.sum(blocks_per_expert, 0)
     gl.store(nv_ptr, num_blocks * BLOCK_M)
-    gl.store(sei_ptr + block_offset, expert.to(gl.int32), mask=hit)
+    for block in gl.static_range(0, MAX_BLOCKS_PER_EXPERT):
+        gl.store(
+            sei_ptr + block_offset + block,
+            expert.to(gl.int32),
+            mask=hit & (block < blocks_per_expert),
+        )
 
     # Only the padded active prefix is consumed downstream. Initialize that
     # dynamic prefix rather than the larger graph-capture allocation bound.
@@ -283,14 +290,18 @@ def moe_align_block_size_fused(
     M, topk = topk_ids.shape
     G = M * topk
     sentinel = M
-    assert M <= block_m, f"fused small-M align needs M ({M}) <= block_m ({block_m})"
+    max_blocks_per_expert = triton.cdiv(M, block_m)
+    assert max_blocks_per_expert <= 2, (
+        "fused small-M align supports at most two blocks per expert; "
+        f"got M={M}, block_m={block_m}"
+    )
 
     # Preserve the original generic fallback outside the bounded LDS path;
     # Kimi's grouped caller only selects this function through MAX_ROUTES.
-    use_quadratic_rank = not (
-        FUSED_ALIGN_QUADRATIC_MAX_ROUTES < G <= FUSED_ALIGN_MAX_ROUTES
+    use_quadratic_rank = (
+        G <= FUSED_ALIGN_QUADRATIC_MAX_ROUTES and max_blocks_per_expert == 1
     )
-    NB_MAX = G if use_quadratic_rank else min(G, num_experts)
+    NB_MAX = G if use_quadratic_rank else min(G, num_experts * max_blocks_per_expert)
     EM_MAX = NB_MAX * block_m
     GP = _next_pow2(G)
     EP = _next_pow2(num_experts)
@@ -339,6 +350,7 @@ def moe_align_block_size_fused(
             EP=EP,
             EXPERT_START=expert_start,
             BLOCK_M=block_m,
+            MAX_BLOCKS_PER_EXPERT=max_blocks_per_expert,
             NB_MAX=NB_MAX,
             EM_MAX=EM_MAX,
             INIT_TILE=_next_pow2(min(1024, EM_MAX)),

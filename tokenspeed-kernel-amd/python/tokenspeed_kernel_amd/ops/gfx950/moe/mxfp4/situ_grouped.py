@@ -93,9 +93,7 @@ GROUPED_ATOMIC_COMBINE_MAX_TOKENS = 0
 # ``static_range`` over TOP_K and its fp32 accumulation order are untouched --
 # only the tiling changes -- so the reduction is bit-identical.  Off by default;
 # set TSK_K3_MOE_REDUCE_DECODE_GEOMETRY=1 to enable.
-_REDUCE_TUNE_SMALL_M = (
-    os.environ.get("TSK_K3_MOE_REDUCE_DECODE_GEOMETRY", "0") == "1"
-)
+_REDUCE_TUNE_SMALL_M = os.environ.get("TSK_K3_MOE_REDUCE_DECODE_GEOMETRY", "0") == "1"
 # Fast-path applicability bound, deliberately a module constant rather than a
 # second environment switch: it is the shape guard for the measurement above,
 # not an independent lever.  64 covers every captured decode size on this
@@ -293,11 +291,12 @@ def _grouped_a16w4_situ_stage1_kernel(
     if expert < 0:
         return
 
+    warps_m: gl.constexpr = 1 if BLOCK_M == 16 else 2
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[2, NUM_WARPS // 2],
+        warps_per_cta=[warps_m, NUM_WARPS // warps_m],
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -561,11 +560,12 @@ def _grouped_a16w4_stage2_kernel(
     if expert < 0:
         return
 
+    warps_m: gl.constexpr = 1 if BLOCK_M == 16 else 2
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[2, NUM_WARPS // 2],
+        warps_per_cta=[warps_m, NUM_WARPS // warps_m],
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -834,9 +834,12 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     ):
         raise ValueError("output must match the hidden-state shape, dtype, and device")
     if block_m is None:
-        # Sparse EP padding dominates until each rank owns roughly 7k routes.
-        # Keep BM64 below M=3584; BM128 then amortizes launch/grid overhead.
-        block_m = 128 if num_tokens >= 3584 else GROUPED_BLOCK_M
+        if num_tokens <= 32:
+            block_m = 16
+        else:
+            # Sparse EP padding dominates until each rank owns roughly 7k routes.
+            # Keep BM64 below M=3584; BM128 then amortizes launch/grid overhead.
+            block_m = 128 if num_tokens >= 3584 else GROUPED_BLOCK_M
     num_experts, two_intermediate, packed_hidden = w13_weight.shape
     intermediate = two_intermediate // 2
     top_k = int(local_topk_ids.shape[1])
@@ -856,14 +859,15 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         intermediate // MXFP4_GROUP_SIZE,
     ):
         raise ValueError("W2 scale shape mismatch")
-    if hidden_dim % 256 or intermediate % 128 or block_m not in (64, 128):
+    supported_block_m = (16, 32, 64, 128)
+    if hidden_dim % 256 or intermediate % 128 or block_m not in supported_block_m:
         raise ValueError(
             "grouped gfx950 A16W4 requires hidden_dim divisible by 256, "
-            "intermediate divisible by 128, and block_m in {64, 128}"
+            "intermediate divisible by 128, and block_m in {16, 32, 64, 128}"
         )
 
     num_routes = num_tokens * top_k
-    if 0 < num_routes <= FUSED_ALIGN_MAX_ROUTES and num_tokens <= block_m:
+    if 0 < num_routes <= FUSED_ALIGN_MAX_ROUTES and num_tokens <= 2 * block_m:
         align = moe_align_block_size_fused
     elif (
         _env_flag(_ALIGN_EP_SWITCH)
@@ -890,7 +894,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
 
     s1_block_n = 64
     s1_block_k = 64
-    s1_warps = {64: 4, 128: 8}[block_m]
+    s1_warps = {16: 4, 32: 4, 64: 4, 128: 8}[block_m]
     if _SMALL_M_WARPS and block_m == _SMALL_M_WARPS_BLOCK_M:
         # Small-M arm: weight-fetch bound, so widen the CTA rather than the
         # tile. Same BLOCK_M/BLOCK_N/BLOCK_K and the same K-loop, so the
@@ -953,7 +957,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         # warps measured slower here (4096 tokens, 434.6 -> 509.1 us), so the
         # large-M shape keeps the original four.
         s2_warps = _SMALL_M_WARPS_COUNT
-    s2_grid =triton.cdiv(em, block_m) * triton.cdiv(hidden_dim, s2_block_n)
+    s2_grid = triton.cdiv(em, block_m) * triton.cdiv(hidden_dim, s2_block_n)
     _grouped_a16w4_stage2_kernel[(s2_grid,)](
         inter,
         w2_weight,

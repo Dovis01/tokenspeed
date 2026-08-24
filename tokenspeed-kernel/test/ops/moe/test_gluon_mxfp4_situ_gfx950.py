@@ -61,11 +61,15 @@ def _assert_kimi_align_contract(
     topk_weights: torch.Tensor,
     num_local_experts: int,
     expert_start: int,
+    block_m: int = 64,
 ) -> None:
     sorted_ids, sorted_experts, sorted_weights, num_valid = result
     num_tokens, top_k = topk_ids.shape
-    block_m = 64
-    max_blocks = min(num_tokens * top_k, num_local_experts)
+    max_blocks_per_expert = (num_tokens + block_m - 1) // block_m
+    max_blocks = min(
+        num_tokens * top_k,
+        num_local_experts * max_blocks_per_expert,
+    )
     assert sorted_ids.shape == (max_blocks * block_m,)
     assert sorted_experts.shape == (max_blocks,)
     assert sorted_weights.shape == sorted_ids.shape
@@ -84,15 +88,27 @@ def _assert_kimi_align_contract(
         for slot in range(top_k)
         if expert_start <= int(ids_cpu[token, slot]) < expert_start + num_local_experts
     }
-    expected_experts = sorted(
-        {int(ids_cpu[token, slot]) - expert_start for token, slot in expected_routes}
-    )
-    assert valid_rows == len(expected_experts) * block_m
-    assert sorted_experts_cpu[:num_blocks].tolist() == expected_experts
+    route_counts = {
+        expert: sum(
+            int(ids_cpu[token, slot]) == expert_start + expert
+            for token, slot in expected_routes
+        )
+        for expert in {
+            int(ids_cpu[token, slot]) - expert_start for token, slot in expected_routes
+        }
+    }
+    expected_blocks = [
+        expert
+        for expert in sorted(route_counts)
+        for _ in range((route_counts[expert] + block_m - 1) // block_m)
+    ]
+    assert valid_rows == len(expected_blocks) * block_m
+    assert sorted_experts_cpu[:num_blocks].tolist() == expected_blocks
     assert torch.all(sorted_experts_cpu[num_blocks:] == -1)
 
     actual_routes: set[tuple[int, int]] = set()
-    for block, local_expert in enumerate(expected_experts):
+    actual_counts = {expert: 0 for expert in route_counts}
+    for block, local_expert in enumerate(expected_blocks):
         real_rows = 0
         for row in range(block * block_m, (block + 1) * block_m):
             packed = int(sorted_ids_cpu[row])
@@ -108,10 +124,12 @@ def _assert_kimi_align_contract(
             assert (token, slot) not in actual_routes
             actual_routes.add((token, slot))
             real_rows += 1
-        assert real_rows == sum(
-            int(ids_cpu[token, slot]) == expert_start + local_expert
-            for token, slot in expected_routes
+        expected_rows = min(
+            block_m,
+            route_counts[local_expert] - actual_counts[local_expert],
         )
+        assert real_rows == expected_rows
+        actual_counts[local_expert] += real_rows
     assert actual_routes == expected_routes
 
 
@@ -137,6 +155,47 @@ def test_fused_lds_align_matches_kimi_ep_contract_gfx950(num_tokens: int) -> Non
         topk_weights,
         num_local_experts,
         expert_start,
+    )
+
+
+@pytest.mark.parametrize(("num_tokens", "block_m"), [(32, 16), (64, 32)])
+def test_fused_lds_align_supports_two_blocks_per_expert_gfx950(
+    num_tokens: int,
+    block_m: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
+        moe_align_block_size_fused,
+    )
+
+    top_k = 16
+    num_local_experts = 112
+    expert_start = 3 * num_local_experts
+    topk_ids = torch.arange(
+        num_tokens * top_k,
+        device="cuda",
+        dtype=torch.int32,
+    ).reshape(num_tokens, top_k)
+    topk_ids %= expert_start
+    topk_ids[:, 0] = expert_start + 7
+    topk_weights = torch.rand(
+        (num_tokens, top_k),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    result = moe_align_block_size_fused(
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+        block_m,
+        expert_start=expert_start,
+    )
+    _assert_kimi_align_contract(
+        result,
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+        expert_start,
+        block_m,
     )
 
 
@@ -396,6 +455,67 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         router_logits,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+    )
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-2)
+
+
+@pytest.mark.parametrize("block_m", [16, 32])
+def test_gluon_grouped_a16w4_situ_supports_small_blocks_gfx950(
+    block_m: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
+        gluon_a16w4_situ_grouped_ep_gfx950,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(125 + block_m)
+    num_tokens = 64
+    num_experts = 2
+    top_k = 1
+    latent_size = 3584
+    intermediate_size = 3072
+    _, raw = _make_mxfp4_module(
+        num_experts=num_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    hidden_states = (
+        torch.randn(
+            (num_tokens, latent_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.1
+    )
+    topk_weights, topk_ids = make_round_robin_topk(
+        num_tokens,
+        num_experts,
+        top_k,
+    )
+    actual = gluon_a16w4_situ_grouped_ep_gfx950(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_weights,
+        topk_ids,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        block_m=block_m,
     )
     expected = a16w4_mxfp4_moe_reference(
         hidden_states,
