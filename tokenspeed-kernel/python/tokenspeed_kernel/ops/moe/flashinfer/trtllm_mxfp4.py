@@ -431,7 +431,7 @@ if platform.is_nvidia:
             output=output,
         )[0]
 
-    def _call_mxfp4_situ_routed_moe(
+    def _call_mxfp4_situ_precomputed_topk_moe(
         w: torch.nn.Module,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -496,6 +496,58 @@ if platform.is_nvidia:
         )
         if not do_finalize:
             # [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
+            return result
+        return output
+
+    def _call_mxfp4_situ_kernel_routing_moe(
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        x: torch.Tensor,
+        output: torch.Tensor | None,
+        enable_pdl: bool,
+        *,
+        hidden_states_scale: torch.Tensor,
+        do_finalize: bool,
+    ) -> torch.Tensor:
+        """Run FlashInfer's public from-logits SiTU MoE entry point."""
+        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        local_expert_offset = getattr(w, "ep_rank", 0) * local_experts
+        num_experts = getattr(w, "num_experts")
+        routing_method = _routing_value(w, "routing_method_type", 2)
+        result = trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=_routing_value(w, "correction_bias", None),
+            hidden_states=x,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=w.w13_weight,
+            gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=w.gemm1_alpha,
+            gemm1_beta=w.gemm1_beta,
+            gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
+            gemm2_weights=w.w2_weight,
+            gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=num_experts,
+            top_k=getattr(w, "top_k"),
+            n_group=_routing_value(w, "n_group", 0),
+            topk_group=_routing_value(w, "topk_group", 0),
+            intermediate_size=getattr(w, "intermediate_size_per_partition"),
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_experts,
+            routed_scaling_factor=_routing_value(w, "routed_scaling_factor", 1.0),
+            routing_method_type=int(routing_method),
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            activation_type=_SITU_ACTIVATION_TYPE,
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
+            norm_topk_prob=_routing_value(w, "normalize_topk_weights", True),
+            output=output if do_finalize else None,
+        )
+        if not do_finalize:
             return result
         return output
 
@@ -586,7 +638,7 @@ if platform.is_nvidia:
             result = result[:, :hidden_original].contiguous()
         return result
 
-    def _register_private_situ_kernel(function):
+    def _register_private_situ_precomputed_topk_kernel(function):
         reason = situ_moe_unavailable_reason()
         if reason is not None:
             # Skipping is normal for deployments that don't serve Kimi-K3, so
@@ -598,7 +650,7 @@ if platform.is_nvidia:
         return register_kernel(
             "moe",
             "apply",
-            name="flashinfer_trtllm_mxfp4_situ_routed_moe_apply",
+            name="flashinfer_trtllm_mxfp4_situ_precomputed_topk_moe_apply",
             solution="flashinfer_trtllm",
             weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
             capability=CapabilityRequirement(
@@ -626,8 +678,104 @@ if platform.is_nvidia:
             priority=Priority.SPECIALIZED,
         )(function)
 
-    @_register_private_situ_kernel
-    def flashinfer_trtllm_mxfp4_situ_routed_moe_apply(
+    def _register_private_situ_kernel_routing_kernel(function):
+        reason = situ_moe_unavailable_reason()
+        if reason is not None:
+            logger.info("Kimi-K3 kernel-routing SiTU MoE not registered: %s", reason)
+            return function
+        return register_kernel(
+            "moe",
+            "apply",
+            name="flashinfer_trtllm_mxfp4_situ_kernel_routing_moe_apply",
+            solution="flashinfer_trtllm",
+            weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(10, 0),
+                max_arch_version=ArchVersion(10, 3),
+            ),
+            signatures=format_signatures("x", "dense", {torch.bfloat16}),
+            traits={
+                "weight_dtype": frozenset({"mxfp4"}),
+                "activation": frozenset({"situ"}),
+                "routing_mode": frozenset({"kernel_routing"}),
+                "supports_deferred_finalize": frozenset({True, False}),
+                "supports_ep": frozenset({True}),
+                "supports_all_to_all_ep": frozenset({False}),
+                "ispp_alignment": frozenset({1}),
+                "internal_activation_dtype": frozenset({"fp8"}),
+                "supports_bias": frozenset({False}),
+            },
+            priority=Priority.SPECIALIZED,
+        )(function)
+
+    @_register_private_situ_kernel_routing_kernel
+    def flashinfer_trtllm_mxfp4_situ_kernel_routing_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        if x.dtype != torch.bfloat16:
+            raise TypeError("FlashInfer MXFP4 SiTU requires bf16 input")
+
+        hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
+        hidden_original = getattr(w, "hidden_size_original", hidden_padded)
+        if x.shape[0] == 0:
+            return x.new_empty(0, hidden_original)
+        if x.shape[-1] > hidden_padded:
+            raise RuntimeError(
+                f"expected hidden size at most {hidden_padded}, got {x.shape[-1]}"
+            )
+        if x.shape[-1] != hidden_padded:
+            x = torch.nn.functional.pad(
+                x,
+                (0, hidden_padded - x.shape[-1]),
+                mode="constant",
+                value=0.0,
+            )
+
+        x, x_scale = mxfp8_quantize(
+            x, False, alignment=hidden_padded, backend="cute-dsl"
+        )
+        hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
+
+        output = None
+        if do_finalize:
+            out_buf = getattr(w, "_situ_output_buffer", None)
+            if (
+                out_buf is not None
+                and out_buf.shape == (x.shape[0], hidden_padded)
+                and out_buf.is_contiguous()
+            ):
+                output = out_buf
+            else:
+                output = torch.empty(
+                    x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
+                )
+        result = _call_mxfp4_situ_kernel_routing_moe(
+            w,
+            router_logits,
+            x,
+            output,
+            enable_pdl,
+            hidden_states_scale=hidden_states_scale,
+            do_finalize=do_finalize,
+        )
+        if not do_finalize:
+            return result
+        if hidden_original != hidden_padded:
+            result = result[:, :hidden_original].contiguous()
+        return result
+
+    @_register_private_situ_precomputed_topk_kernel
+    def flashinfer_trtllm_mxfp4_situ_precomputed_topk_moe_apply(
         plan: dict,
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -688,7 +836,7 @@ if platform.is_nvidia:
         # and/or the runtime's startup autotune window (which exercises this
         # op via the dummy prefill); uncovered shapes take the heuristic
         # fallback. Serving never enters a tuning context.
-        result = _call_mxfp4_situ_routed_moe(
+        result = _call_mxfp4_situ_precomputed_topk_moe(
             w,
             topk_weights,
             topk_ids,

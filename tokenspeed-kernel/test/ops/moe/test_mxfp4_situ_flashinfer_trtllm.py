@@ -81,10 +81,10 @@ class _MoEWeights(torch.nn.Module):
 
 
 @requires_flashinfer_situ
-def test_flashinfer_situ_routed_moe_matches_portable_reference() -> None:
+def test_flashinfer_situ_precomputed_topk_moe_matches_portable_reference() -> None:
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
         flashinfer_trtllm_mxfp4_situ_moe_weights,
-        flashinfer_trtllm_mxfp4_situ_routed_moe_apply,
+        flashinfer_trtllm_mxfp4_situ_precomputed_topk_moe_apply,
     )
 
     generator = torch.Generator().manual_seed(20260729)
@@ -116,7 +116,7 @@ def test_flashinfer_situ_routed_moe_matches_portable_reference() -> None:
 
     w = _MoEWeights({k: v.clone() for k, v in raw.items()}).cuda()
     flashinfer_trtllm_mxfp4_situ_moe_weights({}, w)
-    actual = flashinfer_trtllm_mxfp4_situ_routed_moe_apply(
+    actual = flashinfer_trtllm_mxfp4_situ_precomputed_topk_moe_apply(
         {},
         hidden_states.cuda(),
         w,

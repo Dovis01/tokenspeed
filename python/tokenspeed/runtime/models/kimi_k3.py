@@ -1398,6 +1398,7 @@ class KimiLinearMoE(nn.Module):
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         plan = self.execution_plan
+        use_kernel_routing = plan.use_trtllm
         if not plan.use_native and not plan.use_marlin:
             if not plan.use_trtllm:
                 raise RuntimeError(
@@ -1449,7 +1450,11 @@ class KimiLinearMoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            output_format=TopKOutputFormat.STANDARD,
+            output_format=(
+                TopKOutputFormat.BYPASSED
+                if use_kernel_routing
+                else TopKOutputFormat.STANDARD
+            ),
             # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
             topk_weights_dtype=(
                 torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
@@ -1483,7 +1488,9 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode="precomputed_topk",
+            routing_mode=(
+                "kernel_routing" if use_kernel_routing else "precomputed_topk"
+            ),
             # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
@@ -1499,10 +1506,11 @@ class KimiLinearMoE(nn.Module):
                 )
             ),
         )
-        if self.experts.support_routing:
+        if self.experts.support_routing != use_kernel_routing:
             raise RuntimeError(
-                "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
-                "selected backend unexpectedly performs internal routing"
+                "Kimi-K3 routing mode does not match the selected SiTU MoE kernel: "
+                f"use_trtllm={plan.use_trtllm}, "
+                f"kernel_support_routing={self.experts.support_routing}"
             )
 
         self.routed_expert_down_proj = Kimi3LatentProjection(
