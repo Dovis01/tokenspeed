@@ -79,6 +79,9 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor, num_experts: int | None = None):
         pass
 
+    def on_model_forward_end(self, *, num_tokens: int, is_decode: bool):
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: list[int],
@@ -242,6 +245,51 @@ _global_expert_distribution_recorder: ExpertDistributionRecorder | None = (
 
 def get_global_expert_distribution_recorder():
     return _global_expert_distribution_recorder
+
+
+def initialize_moe_routing_stats_recorder(
+    *,
+    rank: int,
+    layer_ids: tuple[int, ...],
+    num_experts: int,
+    top_k: int,
+    ep_size: int,
+) -> None:
+    """Install the opt-in graph-safe routing profiler for the loaded model."""
+    output_dir = envs.TOKENSPEED_MOE_ROUTING_STATS_DIR.get()
+    if output_dir is None:
+        return
+
+    from tokenspeed.runtime.moe.routing_stats import MoERoutingStatsRecorder
+
+    global _global_expert_distribution_recorder
+    current = _global_expert_distribution_recorder
+    if isinstance(current, MoERoutingStatsRecorder):
+        if current.matches(
+            rank=rank,
+            layer_ids=layer_ids,
+            num_experts=num_experts,
+            top_k=top_k,
+            ep_size=ep_size,
+        ):
+            return
+        raise RuntimeError("MoE routing statistics were initialized for another model")
+    if not isinstance(current, _ExpertDistributionRecorderNoop):
+        raise RuntimeError(
+            "MoE routing statistics cannot run with another expert recorder"
+        )
+
+    _global_expert_distribution_recorder = MoERoutingStatsRecorder(
+        output_dir=output_dir,
+        rank=rank,
+        layer_ids=layer_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        ep_size=ep_size,
+        batch_size=envs.TOKENSPEED_MOE_ROUTING_STATS_BATCH_SIZE.get(),
+        block_size=envs.TOKENSPEED_MOE_ROUTING_STATS_BLOCK_SIZE.get(),
+        max_replays=envs.TOKENSPEED_MOE_ROUTING_STATS_MAX_REPLAYS.get(),
+    )
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------

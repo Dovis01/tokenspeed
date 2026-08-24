@@ -146,6 +146,10 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     K3MoeTailComm,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
+from tokenspeed.runtime.moe.distribution_recorder import (
+    get_global_expert_distribution_recorder,
+    initialize_moe_routing_stats_recorder,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -2441,6 +2445,21 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
+        if config.num_experts is not None:
+            moe_layer_ids = tuple(
+                layer_id
+                for layer_id in range(config.num_hidden_layers)
+                if layer_id >= config.first_k_dense_replace
+                and layer_id % config.moe_layer_freq == 0
+            )
+            initialize_moe_routing_stats_recorder(
+                rank=mapping.rank,
+                layer_ids=moe_layer_ids,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_token,
+                ep_size=mapping.moe.ep_size,
+            )
+
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
         )
@@ -2563,10 +2582,12 @@ class KimiLinearModel(nn.Module):
         )
 
         prefix_sum = hidden_states
+        expert_recorder = get_global_expert_distribution_recorder()
         for layer_idx, layer in enumerate(self.layers):
-            prefix_sum, block_residual = layer(
-                positions, prefix_sum, ctx, out_cache_loc, block_residual
-            )
+            with expert_recorder.with_current_layer(layer_idx):
+                prefix_sum, block_residual = layer(
+                    positions, prefix_sum, ctx, out_cache_loc, block_residual
+                )
             if capture_dflash and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
                     layer_idx, prefix_sum, block_residual
@@ -2591,6 +2612,10 @@ class KimiLinearModel(nn.Module):
             self.output_attn_res_norm,
             num_blocks,
             out_norm=self.norm,
+        )
+        expert_recorder.on_model_forward_end(
+            num_tokens=hidden_states.shape[0],
+            is_decode=ctx.forward_mode.is_decode(),
         )
         return hidden_states, aux_hidden_states
 
