@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
     make_config,
     resolve_dspark_prefix_replay_tokens,
+    scheduler_cache_group_pages,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
@@ -198,25 +199,6 @@ class EventLoop:
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
 
-        # Per-round batch logging lives on the control plane: it reports
-        # scheduler quantities (queue depth, page usage) that the loop already
-        # samples, and its counters stay on this thread.
-        self._batch_logger = BatchLogger(
-            enabled=global_rank == 0,
-            decode_log_interval=server_args.decode_log_interval,
-            # Usable pages, the same total the load snapshot and the
-            # Prometheus gauge publish, so the three never disagree.
-            num_total_pages=geometry.num_usable_pages,
-            spec_num_steps=specs.spec_num_steps,
-            spec_num_tokens=specs.spec_num_tokens,
-            cache_state_group_ids=specs.cache_state_group_ids,
-            # Scheduler counters, read lazily: the scheduler is built below.
-            cache_group_pages=lambda group_id: (
-                self.scheduler.cache_group_total_pages(group_id),
-                self.scheduler.cache_group_available_pages(group_id),
-            ),
-        )
-
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
         self.attn_tp_rank = attn_tp_rank
@@ -343,6 +325,20 @@ class EventLoop:
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        # Per-round batch logging lives on the control plane: it reports
+        # scheduler quantities (queue depth, page usage) that the loop already
+        # samples, and its counters stay on this thread.
+        self._batch_logger = BatchLogger(
+            enabled=global_rank == 0,
+            decode_log_interval=server_args.decode_log_interval,
+            # Usable pages, the same total the load snapshot and the
+            # Prometheus gauge publish, so the three never disagree.
+            num_total_pages=geometry.num_usable_pages,
+            spec_num_steps=specs.spec_num_steps,
+            spec_num_tokens=specs.spec_num_tokens,
+            cache_state_group_ids=specs.cache_state_group_ids,
+            cache_group_pages=scheduler_cache_group_pages(self.scheduler),
+        )
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens

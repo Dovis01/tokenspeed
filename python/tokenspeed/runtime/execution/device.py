@@ -152,9 +152,9 @@ class DeviceBuild:
 class DeviceHandle:
     """What the running control plane may ask of the GPU, and nothing else.
 
-    Every method but ``shutdown`` packages its arguments into a closure and
-    hands that closure to the forward thread, and none of them returns
-    anything the caller could then use to bypass the rest.
+    Every method packages its arguments into a closure and hands that closure
+    to the forward thread, and none of them returns anything the caller could
+    then use to bypass the rest.
     """
 
     def __init__(self, executor) -> None:
@@ -347,14 +347,6 @@ class DeviceHandle:
         runner = self._executor.model_runner
         return self._thread.run(lambda: runner.destroy_weights_update_group(req))
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def shutdown(self) -> None:
-        """Stop the forward thread, draining whatever it still holds."""
-        self._thread.shutdown()
-
 
 class DeviceWiring:
     """Startup-only capabilities: hand the device side to its collaborators.
@@ -391,12 +383,13 @@ class DeviceWiring:
             dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
         )
 
-    def create_l2_cache_executor(self, **options):
+    def create_l2_cache_executor(self, *, host_ratio, host_size_gb, io_backend):
         """Build the host-tier KV cache executor over this engine's pools.
 
         Args:
-            **options: Forwarded to ``L2CacheExecutor`` (host ratio/size, io
-                backend); the device and draft pools are supplied here.
+            host_ratio: Host cache size as a multiple of the device pool.
+            host_size_gb: Absolute host cache size, when set.
+            io_backend: Host<->device transfer backend name.
 
         Returns:
             The configured ``L2CacheExecutor``.
@@ -407,10 +400,20 @@ class DeviceWiring:
         return L2CacheExecutor(
             device_pool=executor.token_to_kv_pool,
             draft_pool=executor.draft_token_to_kv_pool,
-            **options,
+            host_ratio=host_ratio,
+            host_size_gb=host_size_gb,
+            io_backend=io_backend,
         )
 
-    def pd_kv_args(self, *, global_rank: int, ib_device, model_config, **options):
+    def pd_kv_args(
+        self,
+        *,
+        global_rank: int,
+        ib_device,
+        model_config,
+        draft_model_config,
+        pp_layer_window,
+    ):
         """Describe this engine's KV to a PD peer.
 
         Args:
@@ -418,7 +421,8 @@ class DeviceWiring:
                 and the KV-manager rank fields.
             ib_device: The disaggregation InfiniBand device.
             model_config: The target model's config.
-            **options: Forwarded to ``get_kv_args`` (draft config, PP window).
+            draft_model_config: The draft model's config, or None.
+            pp_layer_window: This stage's layer range under PP, else None.
 
         Returns:
             The peer-facing KV argument struct.
@@ -431,7 +435,8 @@ class DeviceWiring:
             ib_device,
             self._executor.token_to_kv_pool,
             model_config=model_config,
-            **options,
+            draft_model_config=draft_model_config,
+            pp_layer_window=pp_layer_window,
         )
 
     def install_pd_step_counter(self, gpu_id: int):

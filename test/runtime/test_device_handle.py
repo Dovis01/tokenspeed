@@ -373,6 +373,37 @@ def test_the_handle_hands_back_no_device_object():
     assert not any(getattr(handle, name, None) is handle._executor for name in public)
 
 
+def test_only_the_builder_constructs_the_device_side():
+    """The name denylist above is a proxy; this is the property itself.
+
+    A device object can only reach the loop if someone constructs one there,
+    so pin the constructors: the three factories that produce model runners,
+    attention backends, KV pools and the executor are called from
+    ``execution/device.py`` alone. (``epd/encode_loop.py`` is a different
+    worker — it builds a vision tower and never a ModelExecutor — so it is
+    not in scope for the scheduler loop's invariant.)
+    """
+    import pathlib
+
+    factories = (
+        "create_model_runner(",
+        "create_attn_components(",
+        "create_model_executor(",
+    )
+    allowed = {"execution/device.py", "execution/factory.py", "epd/encode_loop.py"}
+    root = pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed"
+    offenders = []
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if any(rel.endswith(suffix) for suffix in allowed):
+            continue
+        text = path.read_text()
+        for factory in factories:
+            if factory in text and f"def {factory}" not in text:
+                offenders.append(f"{rel}: {factory}")
+    assert not offenders, offenders
+
+
 def test_collaborators_hold_the_handle_instead_of_walking_to_it():
     """No ``loop.<x>.<y>`` path to the GPU: each hook is handed its own.
 
