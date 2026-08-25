@@ -172,6 +172,39 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 
 
 # ----------------------------------------------------------------------
+# EPD admission: encoder facts resolve past the gate, never before.
+# ----------------------------------------------------------------------
+
+
+def test_text_only_pd_nodes_never_read_the_encoder_facts():
+    """The facts callable must not fire unless the node is an EPD prefill.
+
+    Reading the vision tower's dtype raises on a text-only model, and every
+    text-only PD node passes through this factory — so the facts are handed
+    over as a bound method and resolved only past the manager gate. Passing
+    the VALUE here once crashed every text-only PD deployment at startup.
+    """
+    from tokenspeed.runtime.epd.prefill_admission import make_epd_prefill_admission
+
+    def facts():  # pragma: no cover — reaching this is the failure
+        raise AssertionError("encoder facts read on a non-EPD node")
+
+    admission = make_epd_prefill_admission(
+        SimpleNamespace(disaggregation_mode="decode"),
+        0,
+        model_config=SimpleNamespace(is_multimodal_active=False),
+        encoder_model_facts=facts,
+        mapping=None,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pg_manager=None,
+    )
+
+    assert admission is None
+
+
+# ----------------------------------------------------------------------
 # Multimodal gather: the forward gets a snapshot, not the live struct.
 # ----------------------------------------------------------------------
 

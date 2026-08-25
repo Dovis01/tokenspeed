@@ -49,9 +49,9 @@ What comes back is split three ways, by how long the caller may hold it:
   geometry, speculation widths, capability flags). No device object, safe to
   keep forever, and reading one never goes through the handle.
 - ``DeviceWiring`` — the startup steps that need a real device object:
-  binding the cache scheduler, describing the KV to a PD peer, installing
-  the layerwise step counter. A local of ``EventLoop.__init__``, dropped
-  when it returns.
+  building the host cache tier, describing the KV to a PD peer, installing
+  the layerwise step counter, reading the encoder's model facts. A local of
+  ``EventLoop.__init__``, dropped when it returns.
 - ``DeviceHandle`` — the running handle, and the only one the loop keeps.
 
 The split exists because the wiring list is the one that grows: every new
@@ -170,15 +170,15 @@ class DeviceHandle:
         self,
         planned,
         *,
-        grammar_inputs,
         capture_next_input_ids: bool = False,
     ) -> PendingExecution:
         """Queue this round's model forward; never blocks.
 
+        ``planned`` is the single source of everything the round hands over
+        (see ``PlannedForward``'s field-by-field capture notes).
+
         Args:
             planned: The round's ``PlannedForward``.
-            grammar_inputs: Grammar state for this batch, or None. Passed
-                separately because a role may mask differently than planned.
             capture_next_input_ids: Whether to keep the round's sampled rows
                 for a PD prefill handoff.
 
@@ -192,7 +192,7 @@ class DeviceHandle:
                 planned.forward_op,
                 planned.sampling_params_list,
                 dp_metadata=planned.dp_metadata,
-                grammar_inputs=grammar_inputs,
+                grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
             )
@@ -371,9 +371,10 @@ class DeviceWiring:
     def encoder_model_facts(self) -> EncoderModelFacts:
         """Extract the four model facts EPD admission needs, as plain values.
 
-        Not a ``DeviceSpecs`` field: reading the vision tower's dtype raises
-        on a text-only model, so it stays a call the EPD path makes and no
-        one else does.
+        Not a ``DeviceSpecs`` field, and handed to the EPD path as a BOUND
+        METHOD rather than a value: reading the vision tower's dtype raises
+        on a text-only model, so this must only run after the EPD admission
+        gate has decided the node is a multimodal prefill node.
         """
         model = self._executor.model_runner.model
         return EncoderModelFacts(

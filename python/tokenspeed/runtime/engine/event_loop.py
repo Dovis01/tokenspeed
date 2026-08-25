@@ -517,7 +517,7 @@ class EventLoop:
                     server_args,
                     global_rank,
                     model_config=self.model_config,
-                    model_facts=device.wiring.encoder_model_facts(),
+                    encoder_model_facts=device.wiring.encoder_model_facts,
                     mapping=mapping,
                     attn_tp_rank=self.attn_tp_rank,
                     attn_tp_size=self.attn_tp_size,
