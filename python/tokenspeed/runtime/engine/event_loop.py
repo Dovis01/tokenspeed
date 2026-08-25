@@ -209,7 +209,12 @@ class EventLoop:
             num_total_pages=geometry.num_usable_pages,
             spec_num_steps=specs.spec_num_steps,
             spec_num_tokens=specs.spec_num_tokens,
-            log_cache_group_pages=self._device.log_cache_group_pages,
+            cache_state_group_ids=specs.cache_state_group_ids,
+            # Scheduler counters, read lazily: the scheduler is built below.
+            cache_group_pages=lambda group_id: (
+                self.scheduler.cache_group_total_pages(group_id),
+                self.scheduler.cache_group_available_pages(group_id),
+            ),
         )
 
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
@@ -361,7 +366,6 @@ class EventLoop:
             self.max_model_len,
             self.max_req_input_len,
         )
-        device.wiring.bind_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,

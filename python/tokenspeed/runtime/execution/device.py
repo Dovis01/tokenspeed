@@ -117,6 +117,9 @@ class DeviceSpecs:
         supports_disaggregation: The KV arena can hand pages to a peer node.
         supports_pd_layerwise_finalization: The drafter can finalize
             layerwise KV writes, required for PD layerwise transfer.
+        cache_state_group_ids: Group ids of the state-family cache groups,
+            for the per-group page-usage debug line. Empty for pools with no
+            recurrent/conv state.
     """
 
     cache_geometry: Any
@@ -128,6 +131,7 @@ class DeviceSpecs:
     uses_eager_grammar: bool
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
+    cache_state_group_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -148,10 +152,9 @@ class DeviceBuild:
 class DeviceHandle:
     """What the running control plane may ask of the GPU, and nothing else.
 
-    Almost every method packages its arguments into a closure and hands that
-    closure to the forward thread; the two that do not (``log_cache_group_pages``
-    reads scheduler counters, ``shutdown`` stops the thread) say so. None of
-    them returns anything the caller could then use to bypass the rest.
+    Every method but ``shutdown`` packages its arguments into a closure and
+    hands that closure to the forward thread, and none of them returns
+    anything the caller could then use to bypass the rest.
     """
 
     def __init__(self, executor) -> None:
@@ -307,15 +310,6 @@ class DeviceHandle:
         """
         self._thread.submit(release)
 
-    def log_cache_group_pages(self) -> None:
-        """Emit the per-group page-usage debug line, if that log is enabled.
-
-        Pure scheduler-counter reads, so it does not go over the FIFO; it is
-        here rather than in ``DeviceWiring`` because the batch logger calls
-        it every decode-log interval, long after startup.
-        """
-        self._executor.token_to_kv_pool.maybe_log_cache_group_pages()
-
     # ------------------------------------------------------------------
     # Memory occupation (pause / release / wake)
     # ------------------------------------------------------------------
@@ -396,14 +390,6 @@ class DeviceWiring:
             num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
             dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
         )
-
-    def bind_cache_scheduler(self, scheduler) -> None:
-        """Give the KV pool the C++ scheduler it reports page state to.
-
-        Args:
-            scheduler: The engine's C++ scheduler.
-        """
-        self._executor.token_to_kv_pool.bind_cache_scheduler(scheduler)
 
     def create_l2_cache_executor(self, **options):
         """Build the host-tier KV cache executor over this engine's pools.
@@ -624,6 +610,11 @@ def build_device_side(
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
             getattr(executor.drafter, "supports_pd_layerwise_finalization", False)
+        ),
+        cache_state_group_ids=tuple(
+            str(spec.group_id)
+            for spec in token_to_kv_pool.arena.cache_group_specs
+            if spec.family == "state"
         ),
     )
     return DeviceBuild(
