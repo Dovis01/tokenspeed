@@ -28,11 +28,15 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
     _triton_kpool_decode_append_impl,
+    _triton_kpool_prefill_compress_impl,
     _triton_kpool_prefill_tail_write_impl,
     _triton_kpool_prefill_write_impl,
 )
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
+)
+from tokenspeed_kernel.ops.attention.kpool._triton.prepared_query import (
+    KPoolPreparedQuery,
 )
 from tokenspeed_kernel.ops.attention.kpool._triton.score import (
     _kpool_sort_topk_kernel,
@@ -86,6 +90,51 @@ def triton_kpool_prefill_write(
     return _triton_kpool_prefill_write_impl(
         slot_k=slot_k,
         slot_score=slot_score,
+        write_slots=write_slots,
+        index_values=index_values,
+        index_scales=index_scales,
+        ape=ape,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kpool_prefill_compress",
+    name="triton_kpool_prefill_compress",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(k=dense_tensor_format(torch.bfloat16))}),
+    traits={
+        "head_dim": frozenset({128}),
+        "pool_size": frozenset({2, 4, 8, 16}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+        "rotate": frozenset({True}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_kpool_prefill_compress(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    request_slots: torch.Tensor,
+    n_from_tail: torch.Tensor,
+    chunk_src: torch.Tensor,
+    tail_logical_base: torch.Tensor,
+    write_slots: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    return _triton_kpool_prefill_compress_impl(
+        k=k,
+        gate=gate,
+        tail_k=tail_k,
+        tail_gate=tail_gate,
+        request_slots=request_slots,
+        n_from_tail=n_from_tail,
+        chunk_src=chunk_src,
+        tail_logical_base=tail_logical_base,
         write_slots=write_slots,
         index_values=index_values,
         index_scales=index_scales,
@@ -448,6 +497,28 @@ def triton_dense_kpool_decode_topk(
 
 @register_kernel(
     "attention",
+    "kpool_prefill_prepare_query",
+    name="triton_kpool_prefill_prepare_query",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    traits=_TRAITS,
+    priority=Priority.PORTABLE,
+    tags={"portability", "kpool"},
+)
+def triton_kpool_prefill_prepare_query(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> KPoolPreparedQuery | None:
+    """Portable selection scores BF16 queries directly; nothing to prepare."""
+    del q, weights, softmax_scale
+    return None
+
+
+@register_kernel(
+    "attention",
     "kpool_prefill_topk",
     name="triton_kpool_prefill_topk",
     solution="triton",
@@ -471,6 +542,7 @@ def triton_kpool_prefill_topk(
     kv_page_size: int,
     topk_pools: int,
     softmax_scale: float,
+    prepared_query: KPoolPreparedQuery | None,
     apply_relu: bool = True,
     append_tail: bool = True,
     chunk_pools: int = _DEFAULT_CHUNK_POOLS,
@@ -499,6 +571,7 @@ def triton_kpool_prefill_topk(
         kv_page_size: Raw tokens per FlatKV page.
         topk_pools: Number of pools to select.
         softmax_scale: Per-head score scale.
+        prepared_query: Ignored; portable scoring reads the BF16 queries.
         apply_relu: Apply the indexer ReLU.
         append_tail: Append the visible partial pool.
         chunk_pools: Pools scored per bounded window.
@@ -515,6 +588,7 @@ def triton_kpool_prefill_topk(
     Returns:
         Global FlatKV slots and valid counts.
     """
+    del prepared_query
     pool_size, topk_pools = int(pool_size), int(topk_pools)
     num_tokens = q.shape[0]
     if query_start_loc.dim() != 1 or query_start_loc.numel() < 2:
@@ -587,4 +661,9 @@ def triton_kpool_prefill_topk(
     )
 
 
-__all__ = ["triton_dense_kpool_decode_topk", "triton_kpool_prefill_topk"]
+__all__ = [
+    "triton_dense_kpool_decode_topk",
+    "triton_kpool_prefill_compress",
+    "triton_kpool_prefill_prepare_query",
+    "triton_kpool_prefill_topk",
+]

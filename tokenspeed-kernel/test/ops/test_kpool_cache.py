@@ -28,6 +28,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_append,
+    kpool_prefill_compress,
     kpool_prefill_tail_write,
     kpool_prefill_write,
 )
@@ -639,3 +640,198 @@ def test_decode_append_skips_graph_padding_slot() -> None:
         state.index_scales[0],
     )
     assert all(torch.equal(a, b) for a, b in zip(actual, sentinel, strict=True))
+
+
+@dataclass
+class _CompressPlan:
+    request_slots: torch.Tensor
+    n_from_tail: torch.Tensor
+    chunk_src: torch.Tensor
+    tail_logical_base: torch.Tensor
+    write_slots: torch.Tensor
+
+
+def _compress_plan() -> _CompressPlan:
+    return _CompressPlan(
+        request_slots=torch.tensor([1, 1, 2, 3, 3], dtype=torch.int64, device="cuda"),
+        n_from_tail=torch.tensor([3, 0, 1, 0, 2], dtype=torch.int32, device="cuda"),
+        chunk_src=torch.tensor([0, 1, 5, 8, 12], dtype=torch.int64, device="cuda"),
+        tail_logical_base=torch.tensor(
+            [8, 12, 40, 4, 100], dtype=torch.int64, device="cuda"
+        ),
+        write_slots=torch.tensor(
+            [_ROWS_PER_PAGE + 3, _ROWS_PER_PAGE + 4, 2 * _ROWS_PER_PAGE, 5, 6],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+    )
+
+
+def _assemble_slots(
+    keys: torch.Tensor,
+    gates: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    plan: _CompressPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    offsets = torch.arange(_POOL, dtype=torch.int64, device="cuda").unsqueeze(0)
+    n_from_tail = plan.n_from_tail.to(torch.int64).unsqueeze(1)
+    from_tail = offsets < n_from_tail
+    tail_rows = torch.remainder(plan.tail_logical_base.unsqueeze(1) + offsets, 7)
+    chunk_rows = plan.chunk_src.unsqueeze(1) + torch.clamp(offsets - n_from_tail, min=0)
+    slots = plan.request_slots.unsqueeze(1)
+    slot_keys = torch.where(
+        from_tail.unsqueeze(2), tail_k[slots, tail_rows], keys[chunk_rows]
+    )
+    slot_gates = torch.where(
+        from_tail.unsqueeze(2), tail_gate[slots, tail_rows], gates[chunk_rows]
+    )
+    return slot_keys.contiguous(), slot_gates.contiguous()
+
+
+def test_prefill_compress_matches_two_step_write_bitwise() -> None:
+    state = _state(3, seed=41)
+    plan = _compress_plan()
+    keys = _random((16, _DIM), state.generator, 0.3)
+    gates = _random((16, _DIM), state.generator, 1.5)
+    slot_keys, slot_gates = _assemble_slots(
+        keys, gates, state.tail_k, state.tail_gate, plan
+    )
+    expected_values = state.index_values.clone()
+    expected_scales = state.index_scales.clone()
+    kpool_prefill_write(
+        slot_keys,
+        slot_gates,
+        plan.write_slots,
+        expected_values,
+        expected_scales,
+        state.ape,
+    )
+
+    kpool_prefill_compress(
+        keys,
+        gates,
+        state.tail_k,
+        state.tail_gate,
+        plan.request_slots,
+        plan.n_from_tail,
+        plan.chunk_src,
+        plan.tail_logical_base,
+        plan.write_slots,
+        state.index_values,
+        state.index_scales,
+        state.ape,
+    )
+
+    assert torch.equal(
+        state.index_values.view(torch.uint8), expected_values.view(torch.uint8)
+    )
+    assert torch.equal(state.index_scales, expected_scales)
+    pages = plan.write_slots // _ROWS_PER_PAGE
+    rows = plan.write_slots % _ROWS_PER_PAGE
+    reference_values, reference_scales = _reference_compress(
+        slot_keys, slot_gates, state.ape
+    )
+    _assert_encoded(
+        state.index_values[pages, rows],
+        state.index_scales[pages, rows, 0],
+        reference_values,
+        reference_scales,
+    )
+
+
+def test_prefill_compress_reads_split_key_columns() -> None:
+    state = _state(3, seed=43)
+    plan = _compress_plan()
+    fused = _random((16, _DIM + 32), state.generator, 0.3)
+    keys = fused[:, :_DIM]
+    gates = _random((16, _DIM), state.generator, 1.5)
+    expected_values = state.index_values.clone()
+    expected_scales = state.index_scales.clone()
+    kpool_prefill_compress(
+        keys.contiguous(),
+        gates,
+        state.tail_k,
+        state.tail_gate,
+        plan.request_slots,
+        plan.n_from_tail,
+        plan.chunk_src,
+        plan.tail_logical_base,
+        plan.write_slots,
+        expected_values,
+        expected_scales,
+        state.ape,
+    )
+
+    kpool_prefill_compress(
+        keys,
+        gates,
+        state.tail_k,
+        state.tail_gate,
+        plan.request_slots,
+        plan.n_from_tail,
+        plan.chunk_src,
+        plan.tail_logical_base,
+        plan.write_slots,
+        state.index_values,
+        state.index_scales,
+        state.ape,
+    )
+
+    assert keys.stride(0) == _DIM + 32
+    assert torch.equal(
+        state.index_values.view(torch.uint8), expected_values.view(torch.uint8)
+    )
+    assert torch.equal(state.index_scales, expected_scales)
+
+
+def test_prefill_compress_masks_invalid_rows() -> None:
+    state = _state(3, seed=47)
+    keys = _random((16, _DIM), state.generator, 0.3)
+    gates = _random((16, _DIM), state.generator, 1.5)
+    request_slots = torch.tensor([9, 1, 1], dtype=torch.int64, device="cuda")
+    n_from_tail = torch.tensor([2, 0, 1], dtype=torch.int32, device="cuda")
+    chunk_src = torch.tensor([0, 4, 8], dtype=torch.int64, device="cuda")
+    tail_logical_base = torch.tensor([8, 16, 20], dtype=torch.int64, device="cuda")
+    write_slots = torch.tensor([3, -1, 5], dtype=torch.int64, device="cuda")
+    sentinel_values = state.index_values.clone()
+    sentinel_scales = state.index_scales.clone()
+
+    kpool_prefill_compress(
+        keys,
+        gates,
+        state.tail_k,
+        state.tail_gate,
+        request_slots,
+        n_from_tail,
+        chunk_src,
+        tail_logical_base,
+        write_slots,
+        state.index_values,
+        state.index_scales,
+        state.ape,
+    )
+
+    zero_tail_keys = torch.cat((torch.zeros_like(keys[:2]), keys[0:2])).unsqueeze(0)
+    zero_tail_gates = torch.cat((torch.zeros_like(gates[:2]), gates[0:2])).unsqueeze(0)
+    expected_values, expected_scales = _reference_compress(
+        zero_tail_keys, zero_tail_gates, state.ape
+    )
+    _assert_encoded(
+        state.index_values[0, 3].unsqueeze(0),
+        state.index_scales[0, 3, 0].unsqueeze(0),
+        expected_values,
+        expected_scales,
+    )
+    untouched = torch.ones(_ROWS_PER_PAGE, dtype=torch.bool, device="cuda")
+    untouched[3] = False
+    untouched[5] = False
+    assert torch.equal(
+        state.index_values[0, untouched].view(torch.uint8),
+        sentinel_values[0, untouched].view(torch.uint8),
+    )
+    assert torch.equal(state.index_scales[0, untouched], sentinel_scales[0, untouched])
+    assert torch.equal(
+        state.index_values[1:].view(torch.uint8), sentinel_values[1:].view(torch.uint8)
+    )
+    assert state.index_scales[0, 5, 0] > 0

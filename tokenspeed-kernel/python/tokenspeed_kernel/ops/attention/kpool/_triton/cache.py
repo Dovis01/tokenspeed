@@ -56,6 +56,43 @@ def _kpool_quantize(x):
 
 
 @triton.jit
+def _kpool_online_softmax_step(running_max, denom, acc, score, k):
+    new_max = tl.maximum(running_max, score)
+    rescale = tl.exp(running_max - new_max)
+    prob = tl.exp(score - new_max)
+    return new_max, denom * rescale + prob, acc * rescale + k * prob
+
+
+@triton.jit
+def _kpool_store_compressed_row(
+    quantized,
+    scale,
+    write_slot,
+    offs,
+    mask,
+    index_values_ptr,
+    index_values_stride_page,
+    index_values_stride_row,
+    index_scales_ptr,
+    index_scales_stride_page,
+    index_scales_stride_row,
+    INDEX_ROWS_PER_PAGE: tl.constexpr,
+    INDEX_NUM_PAGES: tl.constexpr,
+):
+    page = write_slot // INDEX_ROWS_PER_PAGE
+    index_row = write_slot % INDEX_ROWS_PER_PAGE
+    valid = (write_slot >= 0) & (page < INDEX_NUM_PAGES)
+    value_base = page * index_values_stride_page + index_row * index_values_stride_row
+    scale_base = page * index_scales_stride_page + index_row * index_scales_stride_row
+    tl.store(
+        index_values_ptr + value_base + offs,
+        quantized.to(index_values_ptr.dtype.element_ty),
+        mask=mask & valid,
+    )
+    tl.store(index_scales_ptr + scale_base, scale, mask=valid)
+
+
+@triton.jit
 def _kpool_prefill_write_kernel(
     slot_k_ptr,
     slot_k_stride_row,
@@ -82,21 +119,7 @@ def _kpool_prefill_write_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
 
-    max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-    for slot in tl.static_range(0, POOL_SIZE):
-        score = tl.load(
-            slot_score_ptr
-            + row * slot_score_stride_row
-            + slot * slot_score_stride_pool
-            + offs,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        score += tl.load(
-            ape_ptr + slot * ape_stride_pool + offs, mask=mask, other=0.0
-        ).to(tl.float32)
-        max_score = tl.maximum(max_score, score)
-
+    running_max = tl.full((BLOCK_D,), -float("inf"), tl.float32)
     acc = tl.zeros((BLOCK_D,), tl.float32)
     denom = tl.zeros((BLOCK_D,), tl.float32)
     for slot in tl.static_range(0, POOL_SIZE):
@@ -111,29 +134,32 @@ def _kpool_prefill_write_kernel(
         score += tl.load(
             ape_ptr + slot * ape_stride_pool + offs, mask=mask, other=0.0
         ).to(tl.float32)
-        prob = tl.exp(score - max_score)
-        denom += prob
         k = tl.load(
             slot_k_ptr + row * slot_k_stride_row + slot * slot_k_stride_pool + offs,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        acc += k * prob
+        running_max, denom, acc = _kpool_online_softmax_step(
+            running_max, denom, acc, score, k
+        )
 
     quantized, scale = _kpool_quantize(acc / denom)
-
     write_slot = tl.load(write_slots_ptr + row).to(tl.int64)
-    page = write_slot // INDEX_ROWS_PER_PAGE
-    index_row = write_slot % INDEX_ROWS_PER_PAGE
-    valid = (write_slot >= 0) & (page < INDEX_NUM_PAGES)
-    value_base = page * index_values_stride_page + index_row * index_values_stride_row
-    scale_base = page * index_scales_stride_page + index_row * index_scales_stride_row
-    tl.store(
-        index_values_ptr + value_base + offs,
-        quantized.to(index_values_ptr.dtype.element_ty),
-        mask=mask & valid,
+    _kpool_store_compressed_row(
+        quantized,
+        scale,
+        write_slot,
+        offs,
+        mask,
+        index_values_ptr,
+        index_values_stride_page,
+        index_values_stride_row,
+        index_scales_ptr,
+        index_scales_stride_page,
+        index_scales_stride_row,
+        INDEX_ROWS_PER_PAGE=INDEX_ROWS_PER_PAGE,
+        INDEX_NUM_PAGES=INDEX_NUM_PAGES,
     )
-    tl.store(index_scales_ptr + scale_base, scale, mask=valid)
 
 
 def _triton_kpool_prefill_write_impl(
@@ -196,6 +222,233 @@ def _triton_kpool_prefill_write_impl(
         INDEX_ROWS_PER_PAGE=index_values.shape[1],
         INDEX_NUM_PAGES=index_values.shape[0],
         POOL_SIZE=pool_size,
+        HEAD_DIM=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit(
+    do_not_specialize=["num_tokens"],
+    do_not_specialize_on_alignment=["num_tokens"],
+)
+def _kpool_prefill_compress_kernel(
+    k_ptr,
+    gate_ptr,
+    tail_k_ptr,
+    tail_gate_ptr,
+    request_slots_ptr,
+    n_from_tail_ptr,
+    chunk_src_ptr,
+    tail_logical_base_ptr,
+    ape_ptr,
+    write_slots_ptr,
+    index_values_ptr,
+    index_scales_ptr,
+    k_stride_row: tl.constexpr,
+    gate_stride_row: tl.constexpr,
+    tail_k_stride_req: tl.constexpr,
+    tail_k_stride_pool: tl.constexpr,
+    tail_gate_stride_req: tl.constexpr,
+    tail_gate_stride_pool: tl.constexpr,
+    ape_stride_pool: tl.constexpr,
+    index_values_stride_page: tl.constexpr,
+    index_values_stride_row: tl.constexpr,
+    index_scales_stride_page: tl.constexpr,
+    index_scales_stride_row: tl.constexpr,
+    num_tokens,
+    INDEX_ROWS_PER_PAGE: tl.constexpr,
+    INDEX_NUM_PAGES: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
+    TAIL_NUM_REQUESTS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < HEAD_DIM
+
+    request_slot = tl.load(request_slots_ptr + row).to(tl.int64)
+    n_from_tail = tl.load(n_from_tail_ptr + row).to(tl.int64)
+    chunk_src = tl.load(chunk_src_ptr + row).to(tl.int64)
+    tail_logical_base = tl.load(tail_logical_base_ptr + row).to(tl.int64)
+    valid_tail = (request_slot >= 0) & (request_slot < TAIL_NUM_REQUESTS)
+    safe_request_slot = tl.where(valid_tail, request_slot, 0)
+
+    running_max = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+    acc = tl.zeros((BLOCK_D,), tl.float32)
+    denom = tl.zeros((BLOCK_D,), tl.float32)
+    for slot in tl.static_range(0, POOL_SIZE):
+        from_tail = slot < n_from_tail
+        tail_row = (tail_logical_base + slot) % TAIL_SIZE
+        chunk_row = chunk_src + (slot - n_from_tail)
+        tail_active = from_tail & valid_tail
+        chunk_active = (
+            (slot >= n_from_tail) & (chunk_row >= 0) & (chunk_row < num_tokens)
+        )
+        safe_chunk_row = tl.where(chunk_active, chunk_row, 0)
+        k_tail = tl.load(
+            tail_k_ptr
+            + safe_request_slot * tail_k_stride_req
+            + tail_row * tail_k_stride_pool
+            + offs,
+            mask=mask & tail_active,
+            other=0.0,
+        )
+        g_tail = tl.load(
+            tail_gate_ptr
+            + safe_request_slot * tail_gate_stride_req
+            + tail_row * tail_gate_stride_pool
+            + offs,
+            mask=mask & tail_active,
+            other=0.0,
+        )
+        k_chunk = tl.load(
+            k_ptr + safe_chunk_row * k_stride_row + offs,
+            mask=mask & chunk_active,
+            other=0.0,
+        )
+        g_chunk = tl.load(
+            gate_ptr + safe_chunk_row * gate_stride_row + offs,
+            mask=mask & chunk_active,
+            other=0.0,
+        )
+        score = tl.where(from_tail, g_tail, g_chunk).to(tl.float32)
+        score += tl.load(
+            ape_ptr + slot * ape_stride_pool + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        k = tl.where(from_tail, k_tail, k_chunk).to(tl.float32)
+        running_max, denom, acc = _kpool_online_softmax_step(
+            running_max, denom, acc, score, k
+        )
+
+    quantized, scale = _kpool_quantize(acc / denom)
+    write_slot = tl.load(write_slots_ptr + row).to(tl.int64)
+    _kpool_store_compressed_row(
+        quantized,
+        scale,
+        write_slot,
+        offs,
+        mask,
+        index_values_ptr,
+        index_values_stride_page,
+        index_values_stride_row,
+        index_scales_ptr,
+        index_scales_stride_page,
+        index_scales_stride_row,
+        INDEX_ROWS_PER_PAGE=INDEX_ROWS_PER_PAGE,
+        INDEX_NUM_PAGES=INDEX_NUM_PAGES,
+    )
+
+
+def _triton_kpool_prefill_compress_impl(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    request_slots: torch.Tensor,
+    n_from_tail: torch.Tensor,
+    chunk_src: torch.Tensor,
+    tail_logical_base: torch.Tensor,
+    write_slots: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    """Gather, compress, and write completed prefill pools in one launch.
+
+    Args:
+        k: Full BF16 prefill keys shaped ``[tokens, 128]``.
+        gate: Matching BF16 per-channel pool scores.
+        tail_k: Request-local key ring holding the pre-chunk pool prefix.
+        tail_gate: Request-local score ring holding the pre-chunk pool prefix.
+        request_slots: Tail ring row for each completed pool.
+        n_from_tail: Leading slots of each pool sourced from the tail ring.
+        chunk_src: First chunk token of each pool's remaining slots.
+        tail_logical_base: Logical position of each pool's first slot.
+        write_slots: Flattened physical index-cache slots.
+        index_values: Paged FP8 pool values, updated in place.
+        index_scales: Paged FP32 pool scales, updated in place.
+        ape: FP32 intra-pool bias shaped ``[pool_size, 128]``.
+    Returns:
+        None. Completed pools are written directly to the cache.
+    """
+    pool_size, head_dim = ape.shape
+    rows = write_slots.numel()
+    metadata = (request_slots, n_from_tail, chunk_src, tail_logical_base, write_slots)
+    if (
+        k.dim() != 2
+        or k.shape[1] != head_dim
+        or gate.shape != k.shape
+        or tail_k.dim() != 3
+        or tail_gate.shape != tail_k.shape
+        or tail_k.shape[2] != head_dim
+        or tail_k.shape[1] < pool_size
+        or index_values.dim() != 3
+        or index_values.shape[-1] != head_dim
+        or index_scales.shape[:2] != index_values.shape[:2]
+    ):
+        raise ValueError("invalid KPool prefill compress geometry")
+    if any(item.dim() != 1 or item.numel() != rows for item in metadata):
+        raise ValueError("KPool prefill compress metadata must have matching rows")
+    integer_dtypes = (torch.int32, torch.int64)
+    if (
+        k.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or tail_k.dtype != torch.bfloat16
+        or tail_gate.dtype != torch.bfloat16
+        or ape.dtype != torch.float32
+        or any(item.dtype not in integer_dtypes for item in metadata)
+    ):
+        raise TypeError("invalid KPool prefill compress dtype")
+    if not k.is_cuda or any(
+        item.device != k.device for item in (gate, tail_k, tail_gate, ape, *metadata)
+    ):
+        raise RuntimeError("KPool prefill compress requires one CUDA device")
+    if (
+        k.stride(1) != 1
+        or gate.stride(1) != 1
+        or tail_k.stride(2) != 1
+        or tail_gate.stride(2) != 1
+        or any(not item.is_contiguous() for item in metadata)
+    ):
+        raise ValueError("KPool prefill compress inputs must use contiguous rows")
+    if rows == 0:
+        return
+
+    ape = ape.contiguous()
+    _kpool_prefill_compress_kernel[(rows,)](
+        k,
+        gate,
+        tail_k,
+        tail_gate,
+        request_slots,
+        n_from_tail,
+        chunk_src,
+        tail_logical_base,
+        ape,
+        write_slots,
+        index_values,
+        index_scales,
+        k.stride(0),
+        gate.stride(0),
+        tail_k.stride(0),
+        tail_k.stride(1),
+        tail_gate.stride(0),
+        tail_gate.stride(1),
+        ape.stride(0),
+        index_values.stride(0),
+        index_values.stride(1),
+        index_scales.stride(0),
+        index_scales.stride(1),
+        num_tokens=k.shape[0],
+        INDEX_ROWS_PER_PAGE=index_values.shape[1],
+        INDEX_NUM_PAGES=index_values.shape[0],
+        POOL_SIZE=pool_size,
+        TAIL_SIZE=tail_k.shape[1],
+        TAIL_NUM_REQUESTS=tail_k.shape[0],
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         num_warps=4,
@@ -429,42 +682,11 @@ def _kpool_decode_append_kernel(
         token_base = req * k_stride_req + step * k_stride_step
         k_new = tl.load(k_ptr + token_base + offs, mask=mask & active, other=0.0)
         g_new = tl.load(gate_ptr + token_base + offs, mask=mask & active, other=0.0)
-        tl.store(
-            tail_k_ptr + tail_base + physical_slot * tail_stride_pool + offs,
-            k_new,
-            mask=mask & active,
-        )
-        tl.store(
-            tail_gate_ptr + tail_base + physical_slot * tail_stride_pool + offs,
-            g_new,
-            mask=mask & active,
-        )
-        tl.debug_barrier()
 
         is_full = active & (logical_slot == POOL_SIZE - 1)
         if is_full:
             pool_logical_start = safe_before - (POOL_SIZE - 1)
-            max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-            for pool_slot in tl.static_range(0, POOL_SIZE):
-                pool_physical_slot = (pool_logical_start + pool_slot) % TAIL_SIZE
-                stored_g = tl.load(
-                    tail_gate_ptr
-                    + tail_base
-                    + pool_physical_slot * tail_stride_pool
-                    + offs,
-                    mask=mask,
-                    other=0.0,
-                )
-                score = tl.where(pool_slot == logical_slot, g_new, stored_g).to(
-                    tl.float32
-                )
-                score += tl.load(
-                    ape_ptr + pool_slot * ape_stride_pool + offs,
-                    mask=mask,
-                    other=0.0,
-                ).to(tl.float32)
-                max_score = tl.maximum(max_score, score)
-
+            running_max = tl.full((BLOCK_D,), -float("inf"), tl.float32)
             acc = tl.zeros((BLOCK_D,), tl.float32)
             denom = tl.zeros((BLOCK_D,), tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
@@ -485,8 +707,6 @@ def _kpool_decode_append_kernel(
                     mask=mask,
                     other=0.0,
                 ).to(tl.float32)
-                prob = tl.exp(score - max_score)
-                denom += prob
                 stored_k = tl.load(
                     tail_k_ptr
                     + tail_base
@@ -498,7 +718,9 @@ def _kpool_decode_append_kernel(
                 k_value = tl.where(pool_slot == logical_slot, k_new, stored_k).to(
                     tl.float32
                 )
-                acc += k_value * prob
+                running_max, denom, acc = _kpool_online_softmax_step(
+                    running_max, denom, acc, score, k_value
+                )
 
             quantized, scale = _kpool_quantize(acc / denom)
 
@@ -530,6 +752,21 @@ def _kpool_decode_append_kernel(
                 + index_row * index_scales_stride_row
             )
             tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
+
+        # The current slot is injected from registers above, so its ring
+        # write can trail the pool reads; the barrier publishes it to the
+        # next step of a multi-token window.
+        tl.store(
+            tail_k_ptr + tail_base + physical_slot * tail_stride_pool + offs,
+            k_new,
+            mask=mask & active,
+        )
+        tl.store(
+            tail_gate_ptr + tail_base + physical_slot * tail_stride_pool + offs,
+            g_new,
+            mask=mask & active,
+        )
+        tl.debug_barrier()
 
 
 def _triton_kpool_decode_append_impl(

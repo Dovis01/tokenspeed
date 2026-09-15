@@ -30,6 +30,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.kpool._triton.prepared_query import (
+    KPoolPreparedQuery,
+)
 from tokenspeed_kernel.ops.attention.kpool.triton import (
     _DEFAULT_CHUNK_POOLS,
     _empty_result,
@@ -607,6 +610,7 @@ def _kpool_prefill_topk_impl(
     kv_page_size: int,
     topk_pools: int,
     softmax_scale: float,
+    prepared_query: KPoolPreparedQuery | None,
     apply_relu: bool = True,
     append_tail: bool = True,
     chunk_pools: int = _DEFAULT_CHUNK_POOLS,
@@ -624,8 +628,10 @@ def _kpool_prefill_topk_impl(
 
     Short selections of at most 2048 pools use ordered head accumulation when
     they fit in one normalized scoring window. Longer or split selections keep
-    the balanced reduction.
+    the balanced reduction. ``prepared_query`` is ignored: the MFMA scorer
+    reads the BF16 queries directly.
     """
+    del prepared_query
     return _kpool_prefill_topk_fp8_gfx950(
         q,
         pooled_k_cache,

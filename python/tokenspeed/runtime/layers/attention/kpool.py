@@ -27,14 +27,17 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.attention.kpool import (
+    KPoolPreparedQuery,
     kpool_decode_append,
     kpool_decode_topk,
+    kpool_prefill_compress,
+    kpool_prefill_prepare_query,
     kpool_prefill_tail_write,
     kpool_prefill_topk,
-    kpool_prefill_write,
 )
 
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -44,16 +47,15 @@ if TYPE_CHECKING:
 class KPoolWritePlan:
     """Physical pooled-index writes and request-local tail updates."""
 
-    pool_req_ids: torch.Tensor
+    pool_request_slots: torch.Tensor
     pool_n_from_tail: torch.Tensor
     pool_chunk_src: torch.Tensor
     pool_tail_logical_base: torch.Tensor
     pool_write_slots: torch.Tensor
-    tail_req_ids: torch.Tensor
+    tail_request_slots: torch.Tensor
     tail_chunk_src: torch.Tensor
     tail_dst_positions: torch.Tensor
     tail_write_counts: torch.Tensor
-    request_slots: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,132 @@ def dsa_prefill_host_lengths(metadata: Any, num_extends: int) -> tuple[int, int]
     )
 
 
+@dataclass(frozen=True)
+class _KPoolHostWritePlan:
+    pool_req_ids: torch.Tensor
+    pool_n_from_tail: torch.Tensor
+    pool_chunk_src: torch.Tensor
+    pool_ids: torch.Tensor
+    pool_tail_logical_base: torch.Tensor
+    tail_req_ids: torch.Tensor
+    tail_chunk_src: torch.Tensor
+    tail_dst_positions: torch.Tensor
+    tail_write_counts: torch.Tensor
+
+    def parts(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.pool_req_ids,
+            self.pool_n_from_tail,
+            self.pool_chunk_src,
+            self.pool_ids,
+            self.pool_tail_logical_base,
+            self.tail_req_ids,
+            self.tail_chunk_src,
+            self.tail_dst_positions,
+            self.tail_write_counts,
+        )
+
+
+def _host_int64(values: torch.Tensor) -> torch.Tensor:
+    if values.device.type != "cpu":
+        raise RuntimeError("KPool plans require scheduler CPU length mirrors")
+    return values.reshape(-1).to(torch.int64)
+
+
+def _kpool_host_write_plan(
+    starts: torch.Tensor, lengths: torch.Tensor, kpool: int
+) -> _KPoolHostWritePlan:
+    """Decompose each request's chunk into completed pools and a tail remainder.
+
+    The first pool of a request splices ``start % kpool`` tokens already held
+    in its tail ring with the chunk's leading tokens; later pools read whole
+    ``kpool``-token runs of the chunk. Tokens past the last completed pool
+    become the request's new tail.
+    """
+    request_ids = torch.arange(starts.numel(), dtype=torch.int64)
+    chunk_begin = torch.cumsum(lengths, 0) - lengths
+    live = lengths > 0
+    first_slot = starts % kpool
+    base_pool = starts // kpool
+    num_pools = torch.where(live, (starts + lengths) // kpool - base_pool, 0)
+
+    pool_req_ids = torch.repeat_interleave(request_ids, num_pools)
+    pool_local = torch.arange(pool_req_ids.numel(), dtype=torch.int64)
+    pool_local -= torch.repeat_interleave(
+        torch.cumsum(num_pools, 0) - num_pools, num_pools
+    )
+    pool_ids = base_pool[pool_req_ids] + pool_local
+    pool_first_slot = first_slot[pool_req_ids]
+    splice = pool_local == 0
+    pool_n_from_tail = torch.where(splice, pool_first_slot, 0)
+    pool_chunk_src = chunk_begin[pool_req_ids] + torch.where(
+        splice, 0, kpool - pool_first_slot + (pool_local - 1) * kpool
+    )
+
+    consumed = torch.where(num_pools > 0, num_pools * kpool - first_slot, 0)
+    tail_count = torch.where(live, lengths - consumed, 0)
+    has_tail = tail_count > 0
+    return _KPoolHostWritePlan(
+        pool_req_ids=pool_req_ids,
+        pool_n_from_tail=pool_n_from_tail.to(torch.int32),
+        pool_chunk_src=pool_chunk_src,
+        pool_ids=pool_ids,
+        pool_tail_logical_base=pool_ids * kpool,
+        tail_req_ids=request_ids[has_tail],
+        tail_chunk_src=(chunk_begin + lengths - tail_count)[has_tail],
+        tail_dst_positions=(starts + consumed)[has_tail],
+        tail_write_counts=tail_count[has_tail].to(torch.int32),
+    )
+
+
+def _index_cache_slots(
+    index_block_table: torch.Tensor,
+    req_ids: torch.Tensor,
+    pool_ids: torch.Tensor,
+    index_rows_per_page: int,
+) -> torch.Tensor:
+    if pool_ids.numel() == 0:
+        return torch.empty(0, dtype=torch.int64, device=index_block_table.device)
+    pages = index_block_table[
+        req_ids, torch.div(pool_ids, index_rows_per_page, rounding_mode="floor")
+    ].to(torch.int64)
+    return pages * index_rows_per_page + torch.remainder(pool_ids, index_rows_per_page)
+
+
+def _finalize_kpool_write_plan(
+    uploaded: tuple[torch.Tensor, ...],
+    *,
+    index_block_table: torch.Tensor,
+    request_slots: torch.Tensor,
+    index_rows_per_page: int,
+) -> KPoolWritePlan:
+    (
+        pool_req_ids,
+        pool_n_from_tail,
+        pool_chunk_src,
+        pool_ids,
+        pool_tail_logical_base,
+        tail_req_ids,
+        tail_chunk_src,
+        tail_dst_positions,
+        tail_write_counts,
+    ) = uploaded
+    request_slots = request_slots.to(device=index_block_table.device, dtype=torch.int64)
+    return KPoolWritePlan(
+        pool_request_slots=request_slots.index_select(0, pool_req_ids),
+        pool_n_from_tail=pool_n_from_tail,
+        pool_chunk_src=pool_chunk_src,
+        pool_tail_logical_base=pool_tail_logical_base,
+        pool_write_slots=_index_cache_slots(
+            index_block_table, pool_req_ids, pool_ids, index_rows_per_page
+        ),
+        tail_request_slots=request_slots.index_select(0, tail_req_ids),
+        tail_chunk_src=tail_chunk_src,
+        tail_dst_positions=tail_dst_positions,
+        tail_write_counts=tail_write_counts,
+    )
+
+
 def build_kpool_write_plan(
     *,
     req_start_positions: torch.Tensor,
@@ -108,93 +236,19 @@ def build_kpool_write_plan(
     index_rows_per_page: int,
 ) -> KPoolWritePlan:
     """Map completed pools to index pages and remainders to request tail slots."""
-    starts = req_start_positions.to(torch.int64).tolist()
-    offsets = query_start_loc.to(torch.int64).tolist()
-    if request_slots.numel() != len(starts):
+    starts = _host_int64(req_start_positions)
+    offsets = _host_int64(query_start_loc)
+    if request_slots.numel() != starts.numel():
         raise ValueError(
             "KPool request-slot count differs from the request count: "
-            f"{request_slots.numel()} != {len(starts)}"
+            f"{request_slots.numel()} != {starts.numel()}"
         )
-
-    pool_req_ids: list[int] = []
-    pool_n_from_tail: list[int] = []
-    pool_chunk_src: list[int] = []
-    pool_tail_logical_base: list[int] = []
-    pool_ids: list[int] = []
-    tail_req_ids: list[int] = []
-    tail_chunk_src: list[int] = []
-    tail_dst_positions: list[int] = []
-    tail_write_counts: list[int] = []
-
-    for req_id, (start, chunk_begin, chunk_end) in enumerate(
-        zip(starts, offsets, offsets[1:])
-    ):
-        length = chunk_end - chunk_begin
-        if length <= 0:
-            continue
-
-        first_slot = start % kpool
-        base_pool = start // kpool
-        num_pools = (start + length) // kpool - base_pool
-        consumed = num_pools * kpool - first_slot if num_pools else 0
-        tail_count = length - consumed
-
-        for pool_index in range(num_pools):
-            pool_id = base_pool + pool_index
-            n_from_tail = first_slot if pool_index == 0 else 0
-            src_local = (
-                0
-                if pool_index == 0
-                else (kpool - first_slot) + (pool_index - 1) * kpool
-            )
-            pool_req_ids.append(req_id)
-            pool_n_from_tail.append(n_from_tail)
-            pool_chunk_src.append(chunk_begin + src_local)
-            pool_tail_logical_base.append(pool_id * kpool)
-            pool_ids.append(pool_id)
-
-        if tail_count:
-            tail_req_ids.append(req_id)
-            tail_chunk_src.append(chunk_begin + length - tail_count)
-            tail_dst_positions.append(start + consumed)
-            tail_write_counts.append(tail_count)
-
-    device = index_block_table.device
-    pool_req_ids_tensor = torch.tensor(pool_req_ids, dtype=torch.int32, device=device)
-    pool_ids_tensor = torch.tensor(pool_ids, dtype=torch.int64, device=device)
-    if pool_ids_tensor.numel() > 0:
-        table_columns = torch.div(
-            pool_ids_tensor,
-            index_rows_per_page,
-            rounding_mode="floor",
-        )
-        write_pages = index_block_table[
-            pool_req_ids_tensor.to(torch.int64), table_columns
-        ].to(torch.int64)
-        pool_write_slots = write_pages * index_rows_per_page + torch.remainder(
-            pool_ids_tensor, index_rows_per_page
-        )
-    else:
-        pool_write_slots = torch.empty(0, dtype=torch.int64, device=device)
-    return KPoolWritePlan(
-        pool_req_ids=pool_req_ids_tensor,
-        pool_n_from_tail=torch.tensor(
-            pool_n_from_tail, dtype=torch.int32, device=device
-        ),
-        pool_chunk_src=torch.tensor(pool_chunk_src, dtype=torch.int64, device=device),
-        pool_tail_logical_base=torch.tensor(
-            pool_tail_logical_base, dtype=torch.int64, device=device
-        ),
-        pool_write_slots=pool_write_slots,
-        tail_req_ids=torch.tensor(tail_req_ids, dtype=torch.int32, device=device),
-        tail_chunk_src=torch.tensor(tail_chunk_src, dtype=torch.int64, device=device),
-        tail_dst_positions=torch.tensor(
-            tail_dst_positions, dtype=torch.int64, device=device
-        ),
-        tail_write_counts=torch.tensor(
-            tail_write_counts, dtype=torch.int32, device=device
-        ),
-        request_slots=request_slots.to(device=device, dtype=torch.int64),
+    host = _kpool_host_write_plan(starts, offsets[1:] - offsets[:-1], kpool)
+    return _finalize_kpool_write_plan(
+        upload_packed(host.parts(), index_block_table.device),
+        index_block_table=index_block_table,
+        request_slots=request_slots,
+        index_rows_per_page=index_rows_per_page,
     )
 
 
@@ -210,6 +264,10 @@ def build_kpool_prefill_plan(
 ) -> KPoolPrefillPlan:
     """Build cache-write and ragged-selection metadata for a prefill batch.
 
+    Every per-request and per-token vector is derived on the host with
+    vectorized integer arithmetic and shipped in one pinned upload; only the
+    page-table gathers run on the device.
+
     Args:
         prefix_lens_cpu: Per-request prefix lengths on CPU.
         extend_lens_cpu: Per-request extend lengths on CPU.
@@ -223,48 +281,46 @@ def build_kpool_prefill_plan(
     Returns:
         Cache-write metadata plus the ragged selection workspace mapping.
     """
-    if prefix_lens_cpu.device.type != "cpu" or extend_lens_cpu.device.type != "cpu":
-        raise RuntimeError("KPool prefill plans require scheduler CPU length mirrors")
-    starts = [int(value) for value in prefix_lens_cpu]
-    lengths = [int(value) for value in extend_lens_cpu]
-    if len(starts) != len(lengths):
+    starts = _host_int64(prefix_lens_cpu)
+    lengths = _host_int64(extend_lens_cpu)
+    if starts.numel() != lengths.numel():
         raise ValueError(
             "KPool prefix and extend length counts differ: "
-            f"{len(starts)} != {len(lengths)}"
+            f"{starts.numel()} != {lengths.numel()}"
+        )
+    if request_slots.numel() != starts.numel():
+        raise ValueError(
+            "KPool request-slot count differs from the request count: "
+            f"{request_slots.numel()} != {starts.numel()}"
+        )
+    negative = torch.nonzero((starts < 0) | (lengths < 0)).reshape(-1)
+    if negative.numel():
+        req_id = int(negative[0])
+        raise ValueError(
+            "KPool prefill lengths must be non-negative, got "
+            f"prefix={int(starts[req_id])}, extend={int(lengths[req_id])} "
+            f"for request {req_id}"
         )
 
-    query_offsets = [0]
-    positions: list[int] = []
-    req_ids: list[int] = []
-    causal_lens: list[int] = []
-    workspace_req_ids: list[int] = []
-    workspace_pool_ids: list[int] = []
-    row_starts: list[int] = []
-    row_ends: list[int] = []
-    workspace_start = 0
-    max_num_pools = 0
+    request_ids = torch.arange(starts.numel(), dtype=torch.int64)
+    query_offsets = torch.zeros(starts.numel() + 1, dtype=torch.int64)
+    torch.cumsum(lengths, 0, out=query_offsets[1:])
+    num_prefill_tokens = int(query_offsets[-1])
+    final_num_pools = (starts + lengths) // kpool
+    workspace_starts = torch.cumsum(final_num_pools, 0) - final_num_pools
+    max_num_pools = int(final_num_pools.max()) if final_num_pools.numel() else 0
 
-    for req_id, (start, length) in enumerate(zip(starts, lengths)):
-        if start < 0 or length < 0:
-            raise ValueError(
-                "KPool prefill lengths must be non-negative, got "
-                f"prefix={start}, extend={length} for request {req_id}"
-            )
-        query_offsets.append(query_offsets[-1] + length)
-        final_num_pools = (start + length) // kpool
-        max_num_pools = max(max_num_pools, final_num_pools)
-        workspace_req_ids.extend([req_id] * final_num_pools)
-        workspace_pool_ids.extend(range(final_num_pools))
-        for offset in range(length):
-            causal = start + offset + 1
-            positions.append(causal - 1)
-            req_ids.append(req_id)
-            causal_lens.append(causal)
-            row_starts.append(workspace_start)
-            row_ends.append(workspace_start + causal // kpool)
-        workspace_start += final_num_pools
+    req_ids = torch.repeat_interleave(request_ids, lengths)
+    positions = torch.arange(num_prefill_tokens, dtype=torch.int64)
+    positions -= torch.repeat_interleave(query_offsets[:-1], lengths)
+    positions += starts[req_ids]
+    causal_lens = positions + 1
+    row_starts = workspace_starts[req_ids]
+    row_ends = row_starts + causal_lens // kpool
+    workspace_req_ids = torch.repeat_interleave(request_ids, final_num_pools)
+    workspace_pool_ids = torch.arange(workspace_req_ids.numel(), dtype=torch.int64)
+    workspace_pool_ids -= torch.repeat_interleave(workspace_starts, final_num_pools)
 
-    num_prefill_tokens = query_offsets[-1]
     if token_capacity is None:
         token_capacity = num_prefill_tokens
     token_capacity = int(token_capacity)
@@ -277,53 +333,60 @@ def build_kpool_prefill_plan(
     if num_padding_tokens:
         # Empty ranges make selection a no-op. A zero causal length also keeps
         # selected-slot attention from reading cache entries for these rows.
-        positions.extend([0] * num_padding_tokens)
-        req_ids.extend([0] * num_padding_tokens)
-        causal_lens.extend([0] * num_padding_tokens)
-        row_starts.extend([0] * num_padding_tokens)
-        row_ends.extend([0] * num_padding_tokens)
+        padding = torch.zeros(num_padding_tokens, dtype=torch.int64)
+        positions = torch.cat((positions, padding))
+        req_ids = torch.cat((req_ids, padding))
+        causal_lens = torch.cat((causal_lens, padding))
+        row_starts = torch.cat((row_starts, padding))
+        row_ends = torch.cat((row_ends, padding))
 
-    device = index_block_table.device
-    workspace_req_ids_tensor = torch.tensor(
-        workspace_req_ids, dtype=torch.int64, device=device
+    host_write = _kpool_host_write_plan(starts, lengths, kpool)
+    write_parts = host_write.parts()
+    uploaded = upload_packed(
+        (
+            *write_parts,
+            positions.to(torch.int32),
+            query_offsets.to(torch.int32),
+            req_ids.to(torch.int32),
+            causal_lens.to(torch.int32),
+            row_starts.to(torch.int32),
+            row_ends.to(torch.int32),
+            workspace_req_ids,
+            workspace_pool_ids,
+        ),
+        index_block_table.device,
     )
-    workspace_pool_ids_tensor = torch.tensor(
-        workspace_pool_ids, dtype=torch.int64, device=device
-    )
-    if workspace_pool_ids_tensor.numel() > 0:
-        table_columns = torch.div(
-            workspace_pool_ids_tensor,
-            index_rows_per_page,
-            rounding_mode="floor",
-        )
-        workspace_pages = index_block_table[workspace_req_ids_tensor, table_columns].to(
-            torch.int64
-        )
-        pool_workspace_slots = workspace_pages * index_rows_per_page + torch.remainder(
-            workspace_pool_ids_tensor, index_rows_per_page
-        )
-    else:
-        pool_workspace_slots = torch.empty(0, dtype=torch.int64, device=device)
-
-    query_start_loc_cpu = torch.tensor(query_offsets, dtype=torch.int64)
-    write = build_kpool_write_plan(
-        req_start_positions=prefix_lens_cpu,
-        query_start_loc=query_start_loc_cpu,
+    write = _finalize_kpool_write_plan(
+        uploaded[: len(write_parts)],
         index_block_table=index_block_table,
         request_slots=request_slots,
-        kpool=kpool,
         index_rows_per_page=index_rows_per_page,
     )
+    (
+        positions,
+        query_start_loc,
+        req_ids,
+        causal_lens,
+        row_starts,
+        row_ends,
+        workspace_req_ids,
+        workspace_pool_ids,
+    ) = uploaded[len(write_parts) :]
     return KPoolPrefillPlan(
         write=write,
         num_prefill_tokens=num_prefill_tokens,
-        positions=torch.tensor(positions, dtype=torch.int32, device=device),
-        query_start_loc=query_start_loc_cpu.to(device=device, dtype=torch.int32),
-        req_ids=torch.tensor(req_ids, dtype=torch.int32, device=device),
-        causal_lens=torch.tensor(causal_lens, dtype=torch.int32, device=device),
-        pool_workspace_slots=pool_workspace_slots.contiguous(),
-        row_starts=torch.tensor(row_starts, dtype=torch.int32, device=device),
-        row_ends=torch.tensor(row_ends, dtype=torch.int32, device=device),
+        positions=positions,
+        query_start_loc=query_start_loc,
+        req_ids=req_ids,
+        causal_lens=causal_lens,
+        pool_workspace_slots=_index_cache_slots(
+            index_block_table,
+            workspace_req_ids,
+            workspace_pool_ids,
+            index_rows_per_page,
+        ),
+        row_starts=row_starts,
+        row_ends=row_ends,
         max_num_pools=max_num_pools,
     )
 
@@ -388,39 +451,17 @@ class KPoolRuntime:
             raise RuntimeError("DSA KPool prefill plan was not initialized")
         plan = shared_plan.write
 
-        num_pools = plan.pool_write_slots.numel()
-        if num_pools > 0:
-            offsets = torch.arange(
-                self.pool_size,
-                dtype=torch.int64,
-                device=key.device,
-            ).unsqueeze(0)
-            from_tail = offsets < plan.pool_n_from_tail.to(torch.int64).unsqueeze(1)
-            tail_rows = torch.remainder(
-                plan.pool_tail_logical_base.unsqueeze(1) + offsets,
-                tail_k.shape[1],
-            )
-            request_slots = plan.request_slots.index_select(
-                0, plan.pool_req_ids.to(torch.int64)
-            )
-            tail_keys = tail_k[request_slots.unsqueeze(1), tail_rows]
-            tail_scores = tail_gate[request_slots.unsqueeze(1), tail_rows]
-            chunk_rows = plan.pool_chunk_src.unsqueeze(1) + torch.clamp(
-                offsets - plan.pool_n_from_tail.to(torch.int64).unsqueeze(1),
-                min=0,
-            )
-            chunk_keys = key.index_select(0, chunk_rows.reshape(-1)).view(
-                num_pools, self.pool_size, -1
-            )
-            chunk_scores = gate.index_select(0, chunk_rows.reshape(-1)).view(
-                num_pools, self.pool_size, -1
-            )
-            slot_keys = torch.where(from_tail.unsqueeze(2), tail_keys, chunk_keys)
-            slot_scores = torch.where(from_tail.unsqueeze(2), tail_scores, chunk_scores)
+        if plan.pool_write_slots.numel() > 0:
             index_values, index_scales = pool.index_k_block_views(index_cache)
-            kpool_prefill_write(
-                slot_keys.contiguous(),
-                slot_scores.contiguous(),
+            kpool_prefill_compress(
+                key,
+                gate,
+                tail_k,
+                tail_gate,
+                plan.pool_request_slots,
+                plan.pool_n_from_tail,
+                plan.pool_chunk_src,
+                plan.pool_tail_logical_base,
                 plan.pool_write_slots,
                 index_values,
                 index_scales,
@@ -428,16 +469,13 @@ class KPoolRuntime:
             )
 
         if plan.tail_write_counts.numel() > 0:
-            destination_slots = plan.request_slots.index_select(
-                0, plan.tail_req_ids.to(torch.int64)
-            )
             kpool_prefill_tail_write(
                 key,
                 gate,
                 tail_k,
                 tail_gate,
                 plan.tail_chunk_src,
-                destination_slots,
+                plan.tail_request_slots,
                 plan.tail_dst_positions,
                 plan.tail_write_counts,
                 pool_size=self.pool_size,
@@ -521,12 +559,40 @@ class KPoolRuntime:
             lens_out=lens_out[decode_start : decode_start + num_decode_tokens],
         )
 
+    def prepare_prefill_query(
+        self,
+        *,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        softmax_scale: float,
+        ctx: ForwardContext,
+        layer_id: int,
+    ) -> KPoolPreparedQuery | None:
+        """Build the query-side top-k inputs that need no pooled-cache reads.
+
+        Returns whatever the planned prefill top-k solution consumes ahead of
+        time, so the caller can issue it while this layer's pools are still
+        being compressed and written.
+        """
+        index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
+        return kpool_prefill_prepare_query(
+            query.contiguous(),
+            index_cache,
+            weights,
+            pool_size=self.pool_size,
+            page_size=index_cache.shape[1],
+            topk_pools=self.index_topk // self.pool_size,
+            softmax_scale=softmax_scale,
+            apply_relu=True,
+        )
+
     def select_prefill(
         self,
         *,
         query: torch.Tensor,
         weights: torch.Tensor,
         softmax_scale: float,
+        prepared_query: KPoolPreparedQuery | None,
         ctx: ForwardContext,
         backend: Any,
         layer_id: int,
@@ -577,6 +643,7 @@ class KPoolRuntime:
             kv_page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             topk_pools=self.index_topk // self.pool_size,
             softmax_scale=softmax_scale,
+            prepared_query=prepared_query,
             req_ids=shared_plan.req_ids,
             causal_lens=shared_plan.causal_lens,
             pool_workspace_slots=shared_plan.pool_workspace_slots,
