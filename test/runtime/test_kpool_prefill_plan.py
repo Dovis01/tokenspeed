@@ -142,7 +142,13 @@ def test_prefill_plan_matches_per_token_reference(
         1, 64, (requests,), dtype=torch.int64, generator=generator
     )
     expected = _reference_prefill_plan(
-        starts, lengths, index_block_table, request_slots, kpool, rows_per_page, token_capacity
+        starts,
+        lengths,
+        index_block_table,
+        request_slots,
+        kpool,
+        rows_per_page,
+        token_capacity,
     )
 
     plan = build_kpool_prefill_plan(
@@ -157,9 +163,10 @@ def test_prefill_plan_matches_per_token_reference(
 
     assert plan.num_prefill_tokens == expected["num_prefill_tokens"]
     assert plan.max_num_pools == expected["max_num_pools"]
-    assert plan.query_start_loc.tolist() == [0, *torch.cumsum(
-        torch.tensor(lengths, dtype=torch.int64), 0
-    ).tolist()]
+    assert plan.query_start_loc.tolist() == [
+        0,
+        *torch.cumsum(torch.tensor(lengths, dtype=torch.int64), 0).tolist(),
+    ]
     for name in ("positions", "req_ids", "causal_lens", "row_starts", "row_ends"):
         assert getattr(plan, name).tolist() == expected[name], name
         assert getattr(plan, name).dtype == torch.int32, name

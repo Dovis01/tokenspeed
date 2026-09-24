@@ -52,7 +52,7 @@ _DEEP_GEMM_TRAITS = {
     "score_activation": frozenset({"relu"}),
     "topk_layout": frozenset({"global_slots"}),
     "topk_pools": frozenset({512, 1024, 2048}),
-    "prefill_plan": frozenset({True}),
+    "has_prefill_plan": frozenset({True}),
 }
 
 
@@ -126,7 +126,6 @@ if current_platform().is_hopper_plus:
         signatures=_DEEP_GEMM_SIGNATURES,
         traits=_DEEP_GEMM_TRAITS,
         priority=Priority.PERFORMANT,
-        tags={"deep_gemm", "kpool", "ragged-prefill"},
     )
     def deep_gemm_kpool_prefill_topk(
         q: torch.Tensor,
