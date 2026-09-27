@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     _prepare_kpool_decode_metadata,
     expand_kpool_to_flat_kv,
     score_kpool_dense,
+    triton_kpool_prefill_topk,
 )
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -628,9 +629,7 @@ def test_prefill_prepare_query_selection_tracks_topk_solution(pool_size: int) ->
     )
     topk = select_kernel("attention", "kpool_prefill_topk", signature, traits=traits)
 
-    assert prepare.name.removesuffix(
-        "_prefill_prepare_query"
-    ) == topk.name.removesuffix("_prefill_topk")
+    assert prepare.name.replace("_prefill_prepare_query", "_prefill_topk") == topk.name
 
 
 def test_prefill_prepare_query_is_none_for_portable_scoring() -> None:
@@ -652,19 +651,42 @@ def test_prefill_prepare_query_is_none_for_portable_scoring() -> None:
     assert prepared is None
 
 
+def test_portable_prefill_rejects_prepared_query() -> None:
+    cache = _build_monotonic_cache(_PAGE)
+    q = torch.zeros((2, _HEADS, _DIM), dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones((2, _HEADS), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="prepared_query=None"):
+        triton_kpool_prefill_topk(
+            q,
+            cache,
+            weights,
+            torch.zeros(2, dtype=torch.int32, device="cuda"),
+            torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+            torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+            torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+            pool_size=8,
+            page_size=_PAGE,
+            kv_page_size=_KV_PAGE,
+            topk_pools=512,
+            softmax_scale=_DIM**-0.5,
+            prepared_query=(q, weights),
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="requires Blackwell DeepGEMM",
 )
-def test_planned_prefill_prepared_query_matches_inline_quantization() -> None:
+@pytest.mark.parametrize("heads", [16, 32, 64])
+def test_planned_prefill_prepared_query_matches_inline_quantization(heads: int) -> None:
     causal_lens = torch.tensor([2051, 2052], dtype=torch.int32, device="cuda")
     num_pools = int(causal_lens[-1]) // _POOL
     cache, _ = _build_cache((num_pools + _PAGE - 1) // _PAGE, seed=5)
     generator = torch.Generator(device="cuda").manual_seed(9)
-    q = (torch.randn((2, _HEADS, _DIM), device="cuda", generator=generator) * 0.3).to(
+    q = (torch.randn((2, heads, _DIM), device="cuda", generator=generator) * 0.3).to(
         torch.bfloat16
     )
-    weights = torch.randn((2, _HEADS), device="cuda", generator=generator).to(
+    weights = torch.randn((2, heads), device="cuda", generator=generator).to(
         torch.bfloat16
     )
     positions = causal_lens - 1
@@ -706,8 +728,9 @@ def test_planned_prefill_prepared_query_matches_inline_quantization() -> None:
     )
     assert prepared is not None
     q_fp8, scaled_weights = prepared
-    assert q_fp8.shape == q.shape and q_fp8.dtype == torch.float8_e4m3fn
-    assert scaled_weights.shape == weights.shape
+    assert q_fp8.shape == (2, max(heads, 32), _DIM)
+    assert q_fp8.dtype == torch.float8_e4m3fn
+    assert scaled_weights.shape == (2, max(heads, 32))
 
     inline = kpool_prefill_topk(
         q,

@@ -55,7 +55,10 @@ its required `prepared_query` keyword:
   head weights with the query dequant scale and the softmax scale folded in,
   which the top-k previously computed inside the call.
 - `triton` (portable) and the Gluon backends score BF16 queries directly and
-  return `None`.
+  return `None` and reject a non-`None` prepared bundle.
+
+DeepGEMM pads 16-head queries and weights to its 32-head ABI in both
+inline and prepared scoring; the added heads contribute zero.
 
 A caller can therefore issue the pooled-cache writes of a layer on one stream
 and `kpool_prefill_prepare_query` on another, join, and run

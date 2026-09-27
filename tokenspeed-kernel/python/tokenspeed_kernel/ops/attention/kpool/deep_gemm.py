@@ -74,6 +74,7 @@ def _kpool_cache_views(
 
 if current_platform().is_hopper_plus:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
+        _pad_index_heads,
         deep_gemm_dsa_prefill_topk,
     )
     from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
@@ -101,7 +102,7 @@ if current_platform().is_hopper_plus:
         depends only on the indexer projections, so callers can issue it while
         the pooled cache is still being written.
         """
-        q = q.contiguous()
+        q, weights = _pad_index_heads(q.contiguous(), weights)
         q_fp8, q_scale = quantize_fp8_with_scale(
             q.view(-1, q.shape[-1]),
             granularity="token_group",

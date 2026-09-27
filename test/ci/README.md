@@ -146,12 +146,21 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+CI runner images are expected to provide `ninja`. Runner setup checks for the
+executable and only refreshes apt metadata and installs `ninja-build` when it is
+missing. This keeps source checkouts independently installable without making
+every ephemeral GPU runner wait on package mirrors before installation.
+
 For model evaluation and performance jobs, the reusable PR task workflow puts
 uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
-shared uv cache. EvalScope dependency installs therefore do not depend on free
-space in a persistent `/cache/uv` volume. The existing always-run work-directory
-cleanup removes the job's uv cache on success or failure. Unit-test, kernel
-benchmark, pip, and release-wheel caches retain their existing policy.
+shared uv cache. The existing always-run work-directory cleanup removes this
+general task cache on success or failure. EvalScope downloads use the dedicated
+`HF_HOME/.uv-cache/evalscope` namespace when a runner provides `HF_HOME`, or an
+explicit `EVALSCOPE_UV_CACHE_DIR` override. Only the `eval.install` and
+`perf.install` stages use this cache, so every job still creates a clean virtual
+environment. Runners without either location continue using the disposable job
+cache. Unit-test, kernel benchmark, pip, and release-wheel caches retain their
+existing policy.
 
 Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
 work directory. Lazy compilation during a request can then write its cache even
@@ -175,12 +184,18 @@ predictions and scoring records under
 misses without changing the full 30-question workload, generation settings, or
 score threshold.
 
-The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
-`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
-the remaining capacity of the shared model volume; the job filesystem provides
-separate writable storage, cleaned up with the work directory. The model ID,
-precision, evaluation workload, and score threshold stay the same. This task
-downloads a fresh checkpoint for each job, so startup includes the download time.
+Model jobs load weights from the runner's shared Hugging Face cache
+(`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
+The work directory is deleted after every job, so a per-job download fetches
+the full checkpoint again on every run. On the AMD runners the work directory
+and the shared cache sit on the same node filesystem, so a per-job copy does
+not add capacity either.
+
+EvalScope perf jobs pass a local tokenizer directory to `--tokenizer-path`.
+EvalScope loads a remote tokenizer ID through ModelScope into the job's
+ephemeral home directory, which downloads it again for every job. The jobs
+instead save the tokenizer from the shared Hugging Face cache into their
+output directory before running the benchmark.
 
 The same model jobs isolate MIOpen's writable user database and kernel cache
 under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
@@ -244,6 +259,11 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   `tokenspeed-scheduler/` require every runner group.
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
+
+PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
+with existing validation and runner/trigger rules. Mixed, empty, or potentially
+truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+retain their existing task selection.
 
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from

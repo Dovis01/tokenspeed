@@ -3,6 +3,7 @@ import shlex
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,27 @@ def flag_value(tokens: list[str], flag: str) -> str:
     assert tokens.count(flag) == 1, f"expected one {flag}, found {tokens.count(flag)}"
     index = tokens.index(flag)
     return tokens[index + 1]
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted((REPO_ROOT / "test" / "ci").rglob("*.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_model_configs_reuse_shared_downloads(path):
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task.get("server", {}).get("command", ""))
+    assert not any(
+        token.split("=", 1)[0] == "--download-dir" for token in server_tokens
+    ), path
+
+    perf_command = task.get("perf", {}).get("command", "")
+    if "--tokenizer-path" in perf_command:
+        perf_tokens = shlex.split(perf_command)
+        assert flag_value(perf_tokens, "--tokenizer-path") == "$TOKENIZER_PATH", path
+        assert "TOKENIZER_PATH=$OUTPUTS_DIR/tokenizer" in perf_tokens, path
+        assert "AutoTokenizer.from_pretrained" in perf_command, path
+        assert ".save_pretrained(" in perf_command, path
 
 
 def test_fork_pr_context_is_exposed_to_ci_tasks():
@@ -173,17 +195,22 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
 
 def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
     filenames = (
-        "deepseek-v4.1-flash-evalscope-gsm8k.yaml",
-        "deepseek-v4.1-flash-evalscope-gsm8k-amd.yaml",
+        "deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml",
+        "deepseek-v4.1-flash-dspark-evalscope-gsm8k-amd.yaml",
     )
     labels = ("b200-4gpu", "amd-mi35x-4gpu-test")
+    names = (
+        "eval-deepseek-v4.1-flash-dspark-gsm8k",
+        "eval-deepseek-v4.1-flash-dspark-gsm8k-amd",
+    )
 
-    for filename, label in zip(filenames, labels, strict=True):
+    for filename, label, name in zip(filenames, labels, names, strict=True):
         task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
         eval_tokens = shlex.split(task["eval"]["command"])
 
         assert task["triggers"] == ["per-commit", "manual"]
+        assert task["name"] == name
         assert task["runner"]["labels"] == [label]
         assert flag_value(server_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
         assert flag_value(server_tokens, "--tensor-parallel-size") == "4"
@@ -201,18 +228,16 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
         assert flag_value(eval_tokens, "--eval-batch-size") == "32"
         assert task["score_threshold"] == 0.90
+        # Both runners load weights from their shared Hugging Face cache.
+        assert "--download-dir" not in server_tokens
 
         if label == "b200-4gpu":
-            assert "--download-dir" not in server_tokens
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
             # The NVIDIA gate exercises the split prefill graph (encoder and
             # decoder graphs around the eager narrowing layer).
             assert "--disable-prefill-graph" not in server_tokens
         else:
-            assert (
-                flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
-            )
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.

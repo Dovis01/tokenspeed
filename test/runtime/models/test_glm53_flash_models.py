@@ -239,6 +239,28 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
     assert result.topk_lens is topk_lens
 
 
+@pytest.mark.parametrize(
+    "has_stream,prefill_tokens,capturing,prefill_graph,expected",
+    [
+        (True, 8, False, False, True),
+        (False, 8, False, False, False),
+        (True, 0, False, False, False),
+        (True, 8, True, False, False),
+        (True, 8, False, True, False),
+    ],
+)
+def test_glm53_flash_prefill_overlap_graph_guards(
+    monkeypatch, has_stream, prefill_tokens, capturing, prefill_graph, expected
+) -> None:
+    attention = Glm53FlashAttention.__new__(Glm53FlashAttention)
+    attention.alt_stream = object() if has_stream else None
+    monkeypatch.setattr(glm53_flash, "get_is_capture_mode", lambda: capturing)
+    monkeypatch.setattr(
+        glm53_flash, "current_forward_ctx", lambda: object() if prefill_graph else None
+    )
+    assert attention._can_overlap_prefill(prefill_tokens) is expected
+
+
 def test_glm53_flash_prefill_topk_forwards_prepared_query() -> None:
     attention = Glm53FlashAttention.__new__(Glm53FlashAttention)
     attention.indexer = SimpleNamespace(weights_softmax_scale=0.25)

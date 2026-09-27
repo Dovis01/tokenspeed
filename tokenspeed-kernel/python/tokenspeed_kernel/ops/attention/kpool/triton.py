@@ -519,7 +519,7 @@ def triton_kpool_prefill_topk(
         kv_page_size: Raw tokens per FlatKV page.
         topk_pools: Number of pools to select.
         softmax_scale: Per-head score scale.
-        prepared_query: Ignored; portable scoring reads the BF16 queries.
+        prepared_query: Must be None; portable scoring reads the BF16 queries.
         apply_relu: Apply the indexer ReLU.
         append_tail: Append the visible partial pool.
         chunk_pools: Pools scored per bounded window.
@@ -536,7 +536,8 @@ def triton_kpool_prefill_topk(
     Returns:
         Global FlatKV slots and valid counts.
     """
-    del prepared_query
+    if prepared_query is not None:
+        raise ValueError("Triton KPool scoring requires prepared_query=None")
     pool_size, topk_pools = int(pool_size), int(topk_pools)
     num_tokens = q.shape[0]
     if query_start_loc.dim() != 1 or query_start_loc.numel() < 2:
